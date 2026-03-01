@@ -5,8 +5,6 @@
 для игры Mafia: The City of Lost Heaven
 
 **Автор:** medved443  
-**При участии:** Grok (xAI)  
-**Год:** 2026
 
 ---
 
