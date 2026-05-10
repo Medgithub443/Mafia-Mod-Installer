@@ -1,42 +1,30 @@
 # =========================================================
-# Mafia Mod Installer v0.11
-# main.py — точка входа GUI
+# Mafia Mod Installer v0.14
+# main.py — точка входа и GUI
 #
-# Структура данных (всё рядом с .exe, в подпапке data/):
-#   <app_dir>/
-#       MafiaModInstaller.exe
-#       logoMaker.exe
-#       assets/   languages/
-#       data/
-#           config.json        — глобальная конфигурация (язык, settings)
-#           mods.json          — глобальная библиотека модов
-#           instances.json     — список экземпляров игры
-#           mods/<mod_id>/...  — распакованные файлы модов
-#           instances/<inst_id>/clean_backup
-#           instances/<inst_id>/user_backups
-#           logos/<hash>.avi   — кэш сгенерированных logo1.avi
-#           logs.txt
+# Бизнес-логика разнесена по модулям:
+#   mmi_paths.py       — пути и константы
+#   mmi_lang.py        — переводы
+#   mmi_utils.py       — общие утилиты, README-детект
+#   mmi_mods.py        — библиотека модов и .mmi
+#   mmi_instances.py   — экземпляры игры
+#   mmi_installer.py   — установка/откат/cleanup/patch_dll
+#   mmi_saves.py       — savegame backup/restore
+#   mmi_logo.py        — генерация logo1.avi через bundled logoMaker.exe
+#   mmi_service.py     — revert all/one, find duplicates, troubleshooter
+#   mmi_version.py     — детекция версии игры (LS3DF.dll)
+#   mmi_gui.py         — иконки и обёртки messagebox
 # =========================================================
 
 import os
-import re
-import sys
-import shutil
-import zipfile
-import json
-import datetime
-import tempfile
 import subprocess
-import locale
+import sys
 import webbrowser
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+import zipfile
+import shutil
 
-try:
-    import patoolib
-    PATOOL_AVAILABLE = True
-except ImportError:
-    PATOOL_AVAILABLE = False
+import tkinter as tk
+from tkinter import ttk, filedialog, simpledialog
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -45,685 +33,30 @@ except ImportError:
     DND_AVAILABLE = False
     TkinterDnD = tk
 
-APP_NAME = "Mafia Mod Installer"
-APP_VERSION = "0.11"
+from mmi_paths import (PATHS, DATA, APP_NAME, APP_VERSION,
+                       DEFAULT_SETTINGS, DEFAULT_PRIORITY,
+                       DEFAULT_RECOMMENDED_COUNT, MMI_README_LIMIT,
+                       GAME_VERSIONS, res_path)
+from mmi_lang import (LANGS, load_languages, detect_lang, set_lang, tr)
+from mmi_utils import (load_json, save_json, slugify, open_path,
+                       detect_steam_path, find_readmes, append_log, now)
+from mmi_mods import (add_mod_to_library, remove_mod_from_library,
+                      update_mod_field, build_mmi, mod_has_saves)
+from mmi_instances import (get_instance_paths, find_instance,
+                           upsert_instance, update_instance)
+from mmi_installer import (cleanup_resources, hard_restore_from,
+                           install_mods_into_game, patch_rw_data_dll)
+from mmi_saves import (make_saves_backup, restore_saves_backup,
+                       delete_saves_backup, delete_saves_backups,
+                       saves_folder)
+from mmi_logo import update_logo_in_game, clear_logo_cache
+from mmi_service import (revert_all_instances, revert_one_instance,
+                         find_duplicate_mods, troubleshoot_scope)
+from mmi_version import detect_game_version, is_rw_data_patched
+from mmi_gui import apply_icon, info_box, error_box, yesno, yesnocancel
 
 
 # =========================================================
-# Расположение программы и данных
-# =========================================================
-
-def app_dir() -> str:
-    """Папка, где лежит .exe (или main.py в dev-режиме)."""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def res_path(rel: str) -> str:
-    """Путь к ресурсам (assets/, languages/) — учитывает PyInstaller _MEIPASS."""
-    base = getattr(sys, "_MEIPASS", app_dir())
-    return os.path.join(base, rel)
-
-
-DATA = os.path.join(app_dir(), "data")
-os.makedirs(DATA, exist_ok=True)
-
-PATHS = {
-    "config": os.path.join(DATA, "config.json"),
-    "mods_json": os.path.join(DATA, "mods.json"),
-    "instances_json": os.path.join(DATA, "instances.json"),
-    "mods_dir": os.path.join(DATA, "mods"),
-    "instances_dir": os.path.join(DATA, "instances"),
-    "logos_dir": os.path.join(DATA, "logos"),
-    "log_file": os.path.join(DATA, "logs.txt"),
-}
-for k in ("mods_dir", "instances_dir", "logos_dir"):
-    os.makedirs(PATHS[k], exist_ok=True)
-
-
-# =========================================================
-# DTA / папки ресурсов
-# =========================================================
-
-DTA_MAP = {
-    "a0.dta": "sounds", "a1.dta": "missions", "a2.dta": "models",
-    "a3.dta": "animations", "a4.dta": "anims", "a5.dta": "maps",
-    "a6.dta": "textures", "a7.dta": "records", "a8.dta": "patch",
-    "a9.dta": "system", "aa.dta": "tables", "ab.dta": "music",
-    "ac.dta": "animations3",
-}
-CLEANUP_FOLDERS = ["anims", "animations", "maps", "models", "sounds",
-                   "tables", "missions", "music", "textures", "records"]
-
-
-# =========================================================
-# Языки
-# =========================================================
-
-LANG = "en"
-LANGS: dict = {}
-LANG_NAMES: dict = {}
-
-
-def load_languages() -> None:
-    global LANGS, LANG_NAMES
-    LANGS, LANG_NAMES = {}, {}
-    lang_dir = res_path("languages")
-    if not os.path.isdir(lang_dir):
-        return
-    for fname in os.listdir(lang_dir):
-        if not fname.endswith(".json"):
-            continue
-        code = os.path.splitext(fname)[0]
-        try:
-            with open(os.path.join(lang_dir, fname), "r", encoding="utf-8") as f:
-                data = json.load(f)
-            LANGS[code] = data
-            LANG_NAMES[code] = data.get("_lang_name", code)
-        except Exception:
-            continue
-
-
-def detect_lang() -> str:
-    try:
-        loc = (locale.getlocale()[0] or "en").lower()
-        if "ru" in loc:
-            return "ru"
-        if "cs" in loc or "cz" in loc:
-            return "cz"
-    except Exception:
-        pass
-    return "en"
-
-
-def tr(key: str) -> str:
-    pack = LANGS.get(LANG) or LANGS.get("en") or {}
-    return pack.get(key, key)
-
-
-# =========================================================
-# JSON / FS утилиты
-# =========================================================
-
-def now() -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def now_compact() -> str:
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
-
-
-def save_json(path, data) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
-def safe_copy(src, dst) -> None:
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    shutil.copy2(src, dst)
-
-
-def append_log(text: str) -> None:
-    try:
-        with open(PATHS["log_file"], "a", encoding="utf-8") as f:
-            f.write(text + "\n")
-    except Exception:
-        pass
-
-
-def open_path(path: str) -> None:
-    if not path or not os.path.exists(path):
-        return
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(path)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except Exception:
-        pass
-
-
-def slugify(name: str, max_len: int = 40) -> str:
-    """Безопасное человекочитаемое имя для папки."""
-    name = name.strip().lower()
-    name = re.sub(r"[^\w\s\-\.]+", "", name, flags=re.UNICODE)
-    name = re.sub(r"[\s\-_\.]+", "_", name).strip("_")
-    return (name or "item")[:max_len]
-
-
-def detect_steam_path() -> str:
-    for p in (r"C:\Program Files (x86)\Steam\steamapps\common\Mafia\Mafia",
-              r"C:\Program Files\Steam\steamapps\common\Mafia\Mafia"):
-        if os.path.exists(p):
-            return p
-    return ""
-
-
-# =========================================================
-# README + определение корня мода
-# =========================================================
-
-GAME_DIRS = {"maps", "missions", "models", "sounds", "tables", "textures",
-             "records", "animations", "anims", "music"}
-GAME_EXTS = (".dta", ".exe", ".dll", ".cfg")
-
-README_KEYWORDS = [
-    "readme", "read me", "readthis", "instruction", "instructions", "guide",
-    "manual", "setup", "install", "notes",
-    "прочитай", "читай", "инструкция", "руководство", "установка",
-    "заметки", "прочти",
-    "navod", "pokyny", "prirucka", "instalace", "návod", "příručka",
-    "przeczytaj", "instrukcja", "instalacja", "czytaj",
-    "liesmich", "anleitung", "handbuch", "installation", "hinweise",
-    "інструкція", "керівництво",
-    "leggimi", "istruzioni", "manuale", "installazione",
-    "olvassel", "utasitas", "kezikonyv", "telepites",
-    "citeste", "instructiuni", "instalare",
-    "procitaj", "uputstvo", "instalacija",
-    "oku", "talimat", "kilavuz", "kurulum",
-]
-README_EXTS = (".txt", ".pdf", ".md", ".rtf", ".doc", ".docx", ".html", ".htm")
-
-
-def is_game_like_folder(path: str) -> bool:
-    try:
-        entries = os.listdir(path)
-        for e in entries:
-            full = os.path.join(path, e)
-            if os.path.isdir(full) and e.lower() in GAME_DIRS:
-                return True
-        for e in entries:
-            full = os.path.join(path, e)
-            if os.path.isfile(full) and e.lower().endswith(GAME_EXTS):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def detect_root_folder(path: str) -> str:
-    if is_game_like_folder(path):
-        return path
-    for root, dirs, _ in os.walk(path):
-        depth = root.replace(path, "").count(os.sep)
-        if depth > 3:
-            continue
-        for d in dirs:
-            candidate = os.path.join(root, d)
-            if is_game_like_folder(candidate):
-                return candidate
-    return path
-
-
-def is_readme_file(file_name: str, dir_path: str) -> bool:
-    lower = file_name.lower()
-    if any(kw in lower for kw in README_KEYWORDS) and lower.endswith(README_EXTS):
-        return True
-    try:
-        files = [f for f in os.listdir(dir_path)
-                 if os.path.isfile(os.path.join(dir_path, f))]
-        text_files = [f for f in files if f.lower().endswith(README_EXTS)]
-        if len(text_files) == 1 and text_files[0] == file_name:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def find_readmes(mod_dir: str):
-    out = []
-    if not mod_dir or not os.path.isdir(mod_dir):
-        return out
-    for root, _, files in os.walk(mod_dir):
-        for f in files:
-            if is_readme_file(f, root):
-                out.append(os.path.join(root, f))
-    return out
-
-
-# =========================================================
-# Архивы
-# =========================================================
-
-def extract_archive(archive_path: str, extract_to: str) -> bool:
-    ext = os.path.splitext(archive_path)[1].lower()
-    if ext in (".zip", ".mmi"):
-        with zipfile.ZipFile(archive_path) as z:
-            z.extractall(extract_to)
-        return True
-    if PATOOL_AVAILABLE:
-        try:
-            patoolib.extract_archive(archive_path, outdir=extract_to, verbosity=-1)
-            return True
-        except Exception:
-            return False
-    return False
-
-
-def build_mmi(mods_to_pack, output_path: str) -> None:
-    """Собрать .mmi (zip) из выбранных модов: каждый — внутренний zip + manifest.json."""
-    manifest = {"version": APP_VERSION, "mods": []}
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as out:
-        for mod in mods_to_pack:
-            mod_dir = mod.get("dir")
-            if not mod_dir or not os.path.isdir(mod_dir):
-                continue
-            inner_name = f"{mod['id']}.zip"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-            tmp.close()
-            try:
-                with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zin:
-                    for root, _, files in os.walk(mod_dir):
-                        for f in files:
-                            full = os.path.join(root, f)
-                            rel = os.path.relpath(full, mod_dir)
-                            zin.write(full, rel)
-                out.write(tmp.name, inner_name)
-                # alias = отображаемое название, выбранное создателем .mmi
-                # (то, как мод показан в его программе). Дублируем в name
-                # для обратной совместимости с v0.10 манифестом.
-                manifest["mods"].append({
-                    "id": mod["id"],
-                    "alias": mod.get("name", ""),
-                    "name": mod.get("name", ""),
-                    "archive": inner_name,
-                })
-            finally:
-                try:
-                    os.unlink(tmp.name)
-                except Exception:
-                    pass
-        out.writestr("manifest.json",
-                     json.dumps(manifest, indent=2, ensure_ascii=False))
-
-
-# =========================================================
-# Глобальная библиотека модов
-# =========================================================
-
-def _new_mod_id(display_name: str) -> str:
-    base = slugify(display_name)
-    existing = {m["id"] for m in load_json(PATHS["mods_json"], [])}
-    cand = base
-    i = 2
-    while cand in existing or os.path.exists(os.path.join(PATHS["mods_dir"], cand)):
-        cand = f"{base}_{i}"
-        i += 1
-    return cand
-
-
-def add_mod_to_library(source_path: str, name: str = None) -> list:
-    """Распаковать архив или скопировать папку в data/mods/<id>/.
-    Если это .mmi с manifest — обработать каждый внутренний zip отдельным модом.
-    Возвращает список добавленных id."""
-    if not os.path.exists(source_path):
-        raise FileNotFoundError(source_path)
-
-    base_label = os.path.basename(source_path).rsplit(".", 1)[0]
-
-    if os.path.isfile(source_path) and source_path.lower().endswith(".mmi"):
-        try:
-            with zipfile.ZipFile(source_path) as z:
-                names = z.namelist()
-                if "manifest.json" in names:
-                    manifest = json.loads(z.read("manifest.json").decode("utf-8"))
-                    added = []
-                    for entry in manifest.get("mods", []):
-                        inner = entry.get("archive")
-                        if not inner or inner not in names:
-                            continue
-                        with tempfile.TemporaryDirectory() as tmp:
-                            tmp_zip = os.path.join(tmp, inner)
-                            with open(tmp_zip, "wb") as fout:
-                                fout.write(z.read(inner))
-                            # При импорте используем alias (отображаемое
-                            # имя, заданное автором .mmi). Падаем на name
-                            # для совместимости со старыми пакетами и на
-                            # имя архива в самом крайнем случае.
-                            display = (entry.get("alias")
-                                       or entry.get("name")
-                                       or os.path.splitext(inner)[0])
-                            added.append(_ingest(tmp_zip, display))
-                    return added
-        except zipfile.BadZipFile:
-            raise
-
-    return [_ingest(source_path, name or base_label)]
-
-
-def _ingest(source_path: str, display_name: str) -> str:
-    mods = load_json(PATHS["mods_json"], [])
-    mod_id = _new_mod_id(display_name)
-    target = os.path.join(PATHS["mods_dir"], mod_id)
-    os.makedirs(target, exist_ok=True)
-
-    if os.path.isdir(source_path):
-        root = detect_root_folder(source_path)
-        shutil.copytree(root, target, dirs_exist_ok=True)
-    else:
-        with tempfile.TemporaryDirectory() as tmp:
-            if not extract_archive(source_path, tmp):
-                shutil.rmtree(target, ignore_errors=True)
-                raise RuntimeError("Не удалось распаковать архив")
-            root = detect_root_folder(tmp)
-            shutil.copytree(root, target, dirs_exist_ok=True)
-
-    files_list = []
-    for root, _, files in os.walk(target):
-        for f in files:
-            files_list.append(os.path.relpath(os.path.join(root, f), target))
-
-    mods.append({
-        "id": mod_id,
-        "name": display_name,
-        "date": now(),
-        "files_count": len(files_list),
-        "dir": target,
-        "files": files_list,
-    })
-    save_json(PATHS["mods_json"], mods)
-    return mod_id
-
-
-def remove_mod_from_library(mod_id: str) -> None:
-    mods = load_json(PATHS["mods_json"], [])
-    new_mods = []
-    target_dir = None
-    for m in mods:
-        if m["id"] == mod_id:
-            target_dir = m.get("dir")
-        else:
-            new_mods.append(m)
-    save_json(PATHS["mods_json"], new_mods)
-    if target_dir and os.path.isdir(target_dir):
-        shutil.rmtree(target_dir, ignore_errors=True)
-    # Снять с активных модов всех экземпляров
-    instances = load_json(PATHS["instances_json"], [])
-    for inst in instances:
-        if mod_id in inst.get("active_mods", []):
-            inst["active_mods"] = [x for x in inst["active_mods"] if x != mod_id]
-    save_json(PATHS["instances_json"], instances)
-
-
-def rename_mod(mod_id: str, new_name: str) -> None:
-    mods = load_json(PATHS["mods_json"], [])
-    for m in mods:
-        if m["id"] == mod_id:
-            m["name"] = new_name
-    save_json(PATHS["mods_json"], mods)
-
-
-# =========================================================
-# Экземпляры игры
-# =========================================================
-
-def _new_instance_id(path: str) -> str:
-    base = slugify(os.path.basename(path.rstrip("/\\")) or "game")
-    existing = {i["id"] for i in load_json(PATHS["instances_json"], [])}
-    cand = base
-    i = 2
-    while cand in existing:
-        cand = f"{base}_{i}"
-        i += 1
-    return cand
-
-
-def get_instance_paths(inst_id: str) -> dict:
-    root = os.path.join(PATHS["instances_dir"], inst_id)
-    paths = {
-        "root": root,
-        "clean": os.path.join(root, "clean_backup"),
-        "user_backups": os.path.join(root, "user_backups"),
-    }
-    os.makedirs(paths["user_backups"], exist_ok=True)
-    return paths
-
-
-def find_instance(instances, instance_id):
-    for i in instances:
-        if i["id"] == instance_id:
-            return i
-    return None
-
-
-def upsert_instance(path: str, exe: str = "Game.exe") -> dict:
-    instances = load_json(PATHS["instances_json"], [])
-    for inst in instances:
-        if inst.get("path") == path:
-            return inst
-    iid = _new_instance_id(path)
-    inst = {
-        "id": iid,
-        "name": os.path.basename(path.rstrip("/\\")) or iid,
-        "path": path,
-        "exe": exe,
-        "active_mods": [],
-        "has_clean_backup": False,
-    }
-    instances.append(inst)
-    save_json(PATHS["instances_json"], instances)
-    return inst
-
-
-def update_instance(inst: dict) -> None:
-    instances = load_json(PATHS["instances_json"], [])
-    for i, x in enumerate(instances):
-        if x["id"] == inst["id"]:
-            instances[i] = inst
-            save_json(PATHS["instances_json"], instances)
-            return
-    instances.append(inst)
-    save_json(PATHS["instances_json"], instances)
-
-
-# =========================================================
-# Установка / восстановление
-# =========================================================
-
-def cleanup_resources(game_path: str, logger) -> None:
-    removed = []
-    for dta, folder in DTA_MAP.items():
-        if os.path.exists(os.path.join(game_path, dta)):
-            folder_path = os.path.join(game_path, folder)
-            if os.path.isdir(folder_path):
-                try:
-                    shutil.rmtree(folder_path)
-                    removed.append(folder)
-                except Exception as e:
-                    logger(f"Ошибка при удалении {folder}: {e}")
-    for folder in CLEANUP_FOLDERS:
-        folder_path = os.path.join(game_path, folder)
-        if os.path.isdir(folder_path) and folder not in removed:
-            try:
-                shutil.rmtree(folder_path)
-                removed.append(folder)
-            except Exception as e:
-                logger(f"Ошибка при удалении {folder}: {e}")
-    logger(f"Удалены папки: {', '.join(removed) if removed else '—'}")
-
-
-def hard_restore_from(backup_path: str, game_path: str) -> None:
-    if not os.path.isdir(backup_path):
-        raise FileNotFoundError(backup_path)
-    for item in os.listdir(game_path):
-        full = os.path.join(game_path, item)
-        try:
-            if os.path.isfile(full) or os.path.islink(full):
-                os.unlink(full)
-            elif os.path.isdir(full):
-                shutil.rmtree(full, ignore_errors=True)
-        except Exception:
-            pass
-    shutil.copytree(backup_path, game_path, dirs_exist_ok=True)
-
-
-def install_mods_into_game(selected_mods, instance, logger) -> None:
-    """Точечное переключение конфигурации модов:
-       1) Откатываем только те файлы, которых касались ранее активные моды
-          (восстанавливаем из clean_backup, либо удаляем если файла там не было).
-       2) Поверх копируем файлы новых выбранных модов.
-       Никакого hard-restore — Steam-housekeeping и любые посторонние файлы
-       в папке игры остаются нетронутыми. Это и фиксит регрессию со Steam-версией."""
-    inst_paths = get_instance_paths(instance["id"])
-    clean_dir = inst_paths["clean"]
-    if not os.path.isdir(clean_dir):
-        raise RuntimeError("Не настроена чистая резервная копия")
-
-    all_mods = load_json(PATHS["mods_json"], [])
-    by_id = {m["id"]: m for m in all_mods}
-
-    prev_files = set()
-    for mid in instance.get("active_mods", []):
-        m = by_id.get(mid)
-        if m:
-            prev_files.update(m.get("files", []))
-
-    new_files = set()
-    for m in selected_mods:
-        new_files.update(m.get("files", []))
-
-    # Откатываем только то, что было модифицировано ранее
-    if prev_files:
-        logger("Возврат изменений предыдущих модов...")
-    for rel in sorted(prev_files):
-        target = os.path.join(instance["path"], rel)
-        clean_src = os.path.join(clean_dir, rel)
-        try:
-            if os.path.exists(clean_src):
-                safe_copy(clean_src, target)
-            elif os.path.exists(target):
-                os.remove(target)
-        except Exception as e:
-            logger(f"Не удалось откатить {rel}: {e}")
-
-    # Применяем выбранные моды
-    total = 0
-    for mod in selected_mods:
-        logger(f"Копирую: {mod.get('name', mod['id'])}")
-        mod_dir = mod["dir"]
-        for rel in mod.get("files", []):
-            src = os.path.join(mod_dir, rel)
-            if os.path.exists(src):
-                safe_copy(src, os.path.join(instance["path"], rel))
-                total += 1
-    logger(tr("installed_files").format(total))
-
-    instance["active_mods"] = [m["id"] for m in selected_mods]
-    update_instance(instance)
-
-
-def patch_rw_data_dll(game_path: str, logger) -> None:
-    """Копирует bundled rw_data.dll поверх файла в папке игры."""
-    src = res_path(os.path.join("assets", "rw_data.dll"))
-    if not os.path.exists(src):
-        raise FileNotFoundError(src)
-    dst = os.path.join(game_path, "rw_data.dll")
-    safe_copy(src, dst)
-    logger(f"rw_data.dll -> {dst}")
-
-
-# =========================================================
-# Логомейкер
-# =========================================================
-
-def _logo_text(selected_mods) -> str:
-    lines = ["INSTALLED MODS:"]
-    if not selected_mods:
-        lines.append(" (none)")
-    else:
-        for i, m in enumerate(selected_mods, 1):
-            lines.append(f" {i}. {m.get('name') or m['id']}")
-    return "\n".join(lines)
-
-
-def _logo_cache_key(selected_mods) -> str:
-    import hashlib
-    payload = "|".join(sorted(m["id"] for m in selected_mods))
-    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
-
-
-def update_logo_in_game(selected_mods, game_path, logger) -> None:
-    cache_key = _logo_cache_key(selected_mods)
-    cached = os.path.join(PATHS["logos_dir"], f"{cache_key}.avi")
-    template = res_path(os.path.join("assets", "logo1.avi"))
-    font = res_path(os.path.join("assets", "aurorabdcnbtrusbyme_bold.otf"))
-
-    if not os.path.exists(template):
-        raise FileNotFoundError(template)
-
-    if not os.path.exists(cached):
-        text = _logo_text(selected_mods)
-        # Сначала пробуем внешний logoMaker.exe (рядом с программой)
-        used_exe = False
-        for exe_name in ("logoMaker.exe", "logoMaker"):
-            exe = os.path.join(app_dir(), exe_name)
-            if os.path.exists(exe):
-                subprocess.run(
-                    [exe, template, cached, font, text, "87", "361", "36"],
-                    check=True)
-                used_exe = True
-                break
-        if not used_exe:
-            from logo_maker import render
-            render(template, cached, font, text, 87, 361, 36)
-
-    shutil.copy2(cached, os.path.join(game_path, "logo1.avi"))
-
-
-# =========================================================
-# GUI helpers
-# =========================================================
-
-ICON_PATH = res_path(os.path.join("assets", "mmi.ico"))
-
-
-def apply_icon(window) -> None:
-    """Установить mmi.ico для окна (тихо игнорирует ошибки на не-Windows)."""
-    if os.path.exists(ICON_PATH):
-        try:
-            window.iconbitmap(ICON_PATH)
-        except Exception:
-            pass
-
-
-def info_box(parent, title, text):
-    apply_icon(parent)
-    messagebox.showinfo(title, text, parent=parent)
-
-
-def error_box(parent, title, text):
-    apply_icon(parent)
-    messagebox.showerror(title, text, parent=parent)
-
-
-def yesno(parent, title, text):
-    apply_icon(parent)
-    return messagebox.askyesno(title, text, parent=parent)
-
-
-def yesnocancel(parent, title, text):
-    apply_icon(parent)
-    return messagebox.askyesnocancel(title, text, parent=parent)
-
-
-# =========================================================
-# Основное окно
-# =========================================================
-
 class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
     def __init__(self):
@@ -731,21 +64,23 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         load_languages()
 
         self.cfg = load_json(PATHS["config"], {})
-        global LANG
-        LANG = self.cfg.get("lang", detect_lang())
-        if LANG not in LANGS:
-            LANG = "en" if "en" in LANGS else next(iter(LANGS), "en")
+        lang = self.cfg.get("lang", detect_lang())
+        if lang not in LANGS:
+            lang = "en" if "en" in LANGS else next(iter(LANGS), "en")
+        set_lang(lang)
 
         self.title(f"{APP_NAME} v{APP_VERSION}")
-        self.geometry("1100x700")
-        self.minsize(960, 620)
+        self.geometry("1140x720")
+        self.minsize(980, 640)
         apply_icon(self)
 
-        self.lang_var = tk.StringVar(value=LANG)
-        self.settings = self.cfg.get("settings", {"insert_logo": True, "save_space": False})
+        self.lang_var = tk.StringVar(value=lang)
+        self.settings = dict(DEFAULT_SETTINGS)
+        self.settings.update(self.cfg.get("settings", {}))
 
         self.upload_path = tk.StringVar()
         self.upload_name = tk.StringVar()
+        self.upload_priority = tk.IntVar(value=DEFAULT_PRIORITY)
 
         self.instances = load_json(PATHS["instances_json"], [])
         if not self.instances:
@@ -754,7 +89,6 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 upsert_instance(steam)
                 self.instances = load_json(PATHS["instances_json"], [])
 
-        # Текущий выбранный экземпляр
         cur_id = self.cfg.get("current_instance")
         if cur_id and find_instance(self.instances, cur_id):
             self.current_instance_id = cur_id
@@ -776,12 +110,12 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         self.refresh_all()
 
-    # ---------- helpers ----------
     @property
     def instance(self):
         return find_instance(self.instances, self.current_instance_id)
 
     def save_cfg(self):
+        from mmi_lang import LANG
         self.cfg["lang"] = LANG
         self.cfg["settings"] = self.settings
         self.cfg["current_instance"] = self.current_instance_id
@@ -797,8 +131,6 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         return None
 
     def _first_launch_check(self):
-        # Чистый бэкап и так создаётся автоматически в clean_backup,
-        # отдельное предупреждение пользователю больше не нужно.
         if not self.cfg.get("launched"):
             self.cfg["launched"] = True
             self.save_cfg()
@@ -876,12 +208,28 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                                command=self.open_settings_dialog)
         menubar.add_cascade(label=tr("menu_settings"), menu=m_settings)
 
+        m_service = tk.Menu(menubar, tearoff=0)
+        m_service.add_command(label=tr("menu_service_open"),
+                              command=self.open_service_dialog)
+        menubar.add_cascade(label=tr("menu_service"), menu=m_service)
+
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label=tr("menu_help_open"), command=self.open_help)
+        menubar.add_cascade(label=tr("menu_help"), menu=m_help)
+
         m_about = tk.Menu(menubar, tearoff=0)
         m_about.add_command(label=tr("menu_about"),
                             command=self.open_about_dialog)
         menubar.add_cascade(label=tr("menu_about"), menu=m_about)
 
         self.config(menu=menubar)
+
+    def open_help(self):
+        path = res_path(os.path.join("assets", "help.html"))
+        if os.path.exists(path):
+            webbrowser.open("file://" + os.path.abspath(path))
+        else:
+            error_box(self, tr("error"), "help.html not found")
 
     def menu_select_game(self):
         path = filedialog.askdirectory(parent=self, title=tr("menu_select_game"))
@@ -941,38 +289,288 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def open_settings_dialog(self):
         win = tk.Toplevel(self)
         win.title(tr("settings_title"))
-        win.geometry("440x190")
+        # Бывшее 560x540 — расширил по вертикали и горизонтали:
+        # тексты с длинными словами не обрезаются.
+        win.geometry("780x720")
         win.transient(self)
-        win.resizable(False, False)
+        win.resizable(True, True)
+        win.minsize(680, 600)
         apply_icon(win)
 
-        v_logo = tk.BooleanVar(value=self.settings.get("insert_logo", True))
-        v_save = tk.BooleanVar(value=self.settings.get("save_space", False))
+        s = self.settings
+        v_logo = tk.BooleanVar(value=s.get("insert_logo", True))
+        v_widescreen = tk.BooleanVar(value=s.get("widescreen", False))
+        v_compress = tk.BooleanVar(value=s.get("compress_backups", False))
+        v_compress_lvl = tk.IntVar(value=s.get("compress_level", 5))
+        v_conflict = tk.BooleanVar(value=s.get("conflict_check", False))
+        v_immutable = tk.BooleanVar(value=s.get("immutable_saves", True))
+        v_auto_backup = tk.BooleanVar(value=s.get("auto_backup_saves", True))
+        v_recommend_on = tk.BooleanVar(value=s.get("recommended_count_on", True))
+        v_recommend_n = tk.IntVar(
+            value=s.get("recommended_count", DEFAULT_RECOMMENDED_COUNT))
 
-        ttk.Checkbutton(win, text=tr("settings_insert_logo"),
-                        variable=v_logo).pack(anchor="w", padx=15, pady=10)
-        ttk.Checkbutton(win, text=tr("settings_save_space"),
-                        variable=v_save).pack(anchor="w", padx=15, pady=5)
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+
+        ttk.Checkbutton(body, text=tr("settings_insert_logo"),
+                        variable=v_logo).pack(anchor="w", pady=4)
+        ttk.Checkbutton(body, text=tr("settings_widescreen"),
+                        variable=v_widescreen).pack(anchor="w", pady=4)
+        ttk.Checkbutton(body, text=tr("settings_conflict_check"),
+                        variable=v_conflict).pack(anchor="w", pady=4)
+        ttk.Checkbutton(body, text=tr("settings_immutable_saves"),
+                        variable=v_immutable).pack(anchor="w", pady=4)
+        ttk.Checkbutton(body, text=tr("settings_auto_backup_saves"),
+                        variable=v_auto_backup).pack(anchor="w", pady=4)
+
+        rcrow = ttk.Frame(body)
+        rcrow.pack(anchor="w", pady=6, fill="x")
+        ttk.Checkbutton(rcrow, text=tr("settings_recommended_count_on"),
+                        variable=v_recommend_on).pack(side="left")
+        ttk.Label(rcrow, text=tr("settings_recommended_count_value")).pack(
+            side="left", padx=(20, 4))
+        ttk.Spinbox(rcrow, from_=1, to=99, textvariable=v_recommend_n,
+                    width=4).pack(side="left")
+
+        cmprow = ttk.Frame(body)
+        cmprow.pack(anchor="w", pady=6, fill="x")
+        ttk.Checkbutton(cmprow, text=tr("settings_compress_backups"),
+                        variable=v_compress).pack(side="left")
+        ttk.Label(cmprow, text=tr("settings_compress_level")).pack(
+            side="left", padx=(20, 4))
+        ttk.Combobox(cmprow, textvariable=v_compress_lvl,
+                     values=[1, 3, 5, 7], state="readonly",
+                     width=4).pack(side="left")
+
+        ttk.Separator(body).pack(fill="x", pady=14)
+
+        btns = ttk.Frame(body)
+        btns.pack(anchor="w", pady=4, fill="x")
+        ttk.Button(btns, text=tr("patch_dll"),
+                   command=lambda: self.patch_dll(parent=win)).pack(
+            side="left", padx=4)
+        ttk.Button(btns, text=tr("settings_clear_cache"),
+                   command=lambda: self._clear_cache_action(parent=win)).pack(
+            side="left", padx=4)
 
         bar = ttk.Frame(win)
-        bar.pack(side="bottom", pady=10)
+        bar.pack(side="bottom", pady=14)
 
         def do_save():
             self.settings["insert_logo"] = v_logo.get()
-            self.settings["save_space"] = v_save.get()
+            self.settings["widescreen"] = v_widescreen.get()
+            self.settings["compress_backups"] = v_compress.get()
+            self.settings["compress_level"] = int(v_compress_lvl.get())
+            self.settings["conflict_check"] = v_conflict.get()
+            self.settings["immutable_saves"] = v_immutable.get()
+            self.settings["auto_backup_saves"] = v_auto_backup.get()
+            self.settings["recommended_count_on"] = v_recommend_on.get()
+            try:
+                self.settings["recommended_count"] = max(
+                    1, int(v_recommend_n.get()))
+            except Exception:
+                self.settings["recommended_count"] = DEFAULT_RECOMMENDED_COUNT
             self.save_cfg()
             win.destroy()
 
         ttk.Button(bar, text=tr("settings_save"),
-                   command=do_save).pack(side="left", padx=8)
+                   command=do_save).pack(side="left", padx=10)
         ttk.Button(bar, text=tr("settings_cancel"),
-                   command=win.destroy).pack(side="left", padx=8)
+                   command=win.destroy).pack(side="left", padx=10)
+
+    def _clear_cache_action(self, parent=None):
+        n = clear_logo_cache()
+        info_box(parent or self, tr("info"),
+                 f"{tr('settings_clear_cache_done')} ({n})")
+
+    # ---------- Service ----------
+    def open_service_dialog(self):
+        win = tk.Toplevel(self)
+        win.title(tr("service_title"))
+        win.geometry("560x340")
+        win.transient(self)
+        apply_icon(win)
+
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+
+        ttk.Button(body, text=tr("service_revert_one"),
+                   command=lambda: self._service_revert_one(win)).pack(
+            fill="x", pady=6)
+        ttk.Button(body, text=tr("service_revert_all"),
+                   command=lambda: self._service_revert_all(win)).pack(
+            fill="x", pady=6)
+        ttk.Button(body, text=tr("service_find_dupes"),
+                   command=lambda: self._service_find_dupes(win)).pack(
+            fill="x", pady=6)
+        ttk.Button(body, text=tr("service_troubleshoot"),
+                   command=lambda: self._service_troubleshoot(win)).pack(
+            fill="x", pady=6)
+        ttk.Button(body, text=tr("close"),
+                   command=win.destroy).pack(side="bottom", pady=10)
+
+    def _service_revert_one(self, parent):
+        inst = self.instance
+        if not inst:
+            return
+        if not yesno(parent, tr("service_revert_one"),
+                     tr("service_revert_one_confirm").format(inst["name"])):
+            return
+        ok = revert_one_instance(inst, self.log)
+        if ok:
+            info_box(parent, tr("info"),
+                     tr("service_revert_one_done").format(inst["name"]))
+            self.instances = load_json(PATHS["instances_json"], [])
+            self.refresh_all()
+
+    def _service_revert_all(self, parent):
+        if not self.instances:
+            return
+        if not yesno(parent, tr("service_title"),
+                     tr("service_revert_all_confirm1")):
+            return
+        if not yesno(parent, tr("service_title"),
+                     tr("service_revert_all_confirm2").format(len(self.instances))):
+            return
+        n = revert_all_instances(self.log)
+        info_box(parent, tr("info"), tr("service_revert_all_done").format(n))
+        self.instances = load_json(PATHS["instances_json"], [])
+        self.refresh_all()
+
+    def _service_find_dupes(self, parent):
+        dupes = find_duplicate_mods()
+        if not dupes:
+            info_box(parent, tr("info"), tr("service_no_dupes"))
+            return
+        lines = []
+        for cs, lst in dupes.items():
+            names = " | ".join(m.get("name") or m["id"] for m in lst)
+            lines.append(f"  {cs[:12]}…  {names}")
+        info_box(parent, tr("info"),
+                 tr("service_dupes_found").format("\n".join(lines)))
+
+    # ---------- Troubleshooter wizard ----------
+    def _service_troubleshoot(self, parent):
+        win = tk.Toplevel(parent)
+        win.title(tr("service_troubleshoot"))
+        win.geometry("680x520")
+        win.transient(parent)
+        apply_icon(win)
+
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text=tr("ts_step1_title"),
+                  font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 6))
+        ttk.Label(body, text=tr("ts_step1_hint")).pack(anchor="w", pady=(0, 8))
+
+        scope_var = tk.StringVar(value="active_in_game")
+        ttk.Radiobutton(body, text=tr("ts_scope_active"),
+                        variable=scope_var, value="active_in_game").pack(
+            anchor="w", pady=2)
+        ttk.Radiobutton(body, text=tr("ts_scope_one_mod"),
+                        variable=scope_var, value="one_mod").pack(
+            anchor="w", pady=2)
+
+        ttk.Label(body, text=tr("ts_pick_mod")).pack(anchor="w", pady=(8, 2))
+        all_mods = load_json(PATHS["mods_json"], [])
+        choices = [(m.get("name") or m["id"]) for m in all_mods]
+        mod_var = tk.StringVar(value=choices[0] if choices else "")
+        cb = ttk.Combobox(body, textvariable=mod_var, values=choices,
+                          state="readonly")
+        cb.pack(fill="x", pady=2)
+
+        out = tk.Text(body, wrap=tk.WORD, height=14)
+        out.pack(fill="both", expand=True, pady=(10, 4))
+        out.config(state="disabled")
+
+        def _print(line):
+            out.config(state="normal")
+            out.insert(tk.END, line + "\n")
+            out.config(state="disabled")
+            out.see(tk.END)
+
+        def _run():
+            out.config(state="normal")
+            out.delete("1.0", tk.END)
+            out.config(state="disabled")
+            inst = self.instance
+            scope = scope_var.get()
+            if scope == "one_mod":
+                name = mod_var.get()
+                target = next((m for m in all_mods
+                               if (m.get("name") or m["id"]) == name), None)
+                if not target:
+                    _print(tr("ts_no_active"))
+                    return
+                reports = troubleshoot_scope("one_mod", target["id"], inst)
+            else:
+                if not inst or not inst.get("active_mods"):
+                    _print(tr("ts_no_active"))
+                    return
+                reports = troubleshoot_scope("active_in_game", None, inst)
+
+            _print("=== " + tr("ts_report_title") + " ===")
+            any_issue = False
+            for r in reports:
+                _print(f"\n[{r['name']}]")
+                for issue in r["issues"]:
+                    k = issue.get("kind")
+                    if k == "ok":
+                        _print("  ✓ " + tr("ts_no_problems"))
+                        continue
+                    any_issue = True
+                    if k == "version_mismatch":
+                        _print("  ✗ " + tr("ts_issue_version_mismatch").format(
+                            mod_version=issue["mod_version"],
+                            game_version=issue["game_version"]))
+                    elif k == "rw_data_unpatched":
+                        _print("  ✗ " + tr("ts_issue_rw_unpatched"))
+                    elif k == "standalone_installer":
+                        _print("  ✗ " + tr("ts_issue_standalone").format(
+                            files=", ".join(issue["files"])))
+                    elif k == "no_resource_dirs":
+                        _print("  ✗ " + tr("ts_issue_no_dirs"))
+                for rec in r["recommendations"]:
+                    _print("    → " + rec)
+            if any_issue:
+                _print("\n" + tr("ts_help_links"))
+
+        ttk.Button(body, text=tr("ts_run"), command=_run).pack(
+            anchor="e", pady=(4, 0))
+        ttk.Button(body, text=tr("close"), command=win.destroy).pack(
+            anchor="e", pady=(4, 0))
+
+    # ---------- Version info ----------
+    def show_version_dialog(self):
+        inst = self.instance
+        if not inst:
+            return
+        info = detect_game_version(inst["path"])
+        ver = info.get("version") or tr("game_version_unknown")
+        if info.get("dll_present"):
+            dll_state = f"{info.get('dll_size'):,} bytes"
+        else:
+            dll_state = tr("game_version_unknown")
+        # rw_data.dll
+        patched = is_rw_data_patched(inst["path"])
+        if patched is True:
+            rw_state = tr("rw_state_patched")
+        elif patched is False:
+            rw_state = tr("rw_state_vanilla")
+        else:
+            rw_state = tr("rw_state_unknown")
+
+        text = tr("game_version_text").format(
+            path=inst["path"], version=ver, dll=dll_state,
+            dll_state=rw_state)
+        info_box(self, tr("game_version_title"), text)
 
     # ---------- About modal ----------
     def open_about_dialog(self):
         win = tk.Toplevel(self)
         win.title(tr("about_title"))
-        win.geometry("560x520")
+        win.geometry("580x540")
         win.transient(self)
         apply_icon(win)
 
@@ -982,7 +580,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                   font=("Arial", 11)).pack(pady=(0, 10))
         ttk.Separator(win, orient="horizontal").pack(fill="x", padx=30, pady=8)
 
-        body = tk.Text(win, wrap=tk.WORD, height=14, width=64,
+        body = tk.Text(win, wrap=tk.WORD, height=15, width=64,
                        font=("Arial", 10), borderwidth=0,
                        background=win.cget("background"))
         body.pack(padx=20, pady=10, fill="both", expand=True)
@@ -1004,8 +602,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     # UI
     # =====================================================
     def change_lang(self, *_):
-        global LANG
-        LANG = self.lang_var.get()
+        set_lang(self.lang_var.get())
         self.save_cfg()
         self.rebuild_ui()
 
@@ -1027,8 +624,9 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
     def log(self, text):
         line = f"[{now()}] {text}"
-        self.logbox.insert(tk.END, line + "\n")
-        self.logbox.see(tk.END)
+        if hasattr(self, "logbox"):
+            self.logbox.insert(tk.END, line + "\n")
+            self.logbox.see(tk.END)
         append_log(line)
 
     def create_ui(self):
@@ -1036,7 +634,6 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         style.configure("TButton", padding=6)
         style.configure("TLabel", padding=3)
 
-        # Верхняя панель
         top = ttk.Frame(self, padding=5)
         top.pack(fill="x")
         ttk.Label(top, text="Language:").pack(side="right", padx=5)
@@ -1049,20 +646,23 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         main = ttk.Frame(self, padding=10)
         main.pack(fill="both", expand=True)
 
-        notebook = ttk.Notebook(main)
-        notebook.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill="both", expand=True)
 
-        self.tab_install = ttk.Frame(notebook, padding=10)
-        self.tab_mods = ttk.Frame(notebook, padding=10)
-        self.tab_upload = ttk.Frame(notebook, padding=10)
+        self.tab_install = ttk.Frame(self.notebook, padding=10)
+        self.tab_mods = ttk.Frame(self.notebook, padding=10)
+        self.tab_upload = ttk.Frame(self.notebook, padding=10)
+        self.tab_saves = ttk.Frame(self.notebook, padding=10)
 
-        notebook.add(self.tab_install, text=tr("install_tab"))
-        notebook.add(self.tab_mods, text=tr("mods_tab"))
-        notebook.add(self.tab_upload, text=tr("upload_tab"))
+        self.notebook.add(self.tab_install, text=tr("install_tab"))
+        self.notebook.add(self.tab_mods, text=tr("mods_tab"))
+        self.notebook.add(self.tab_upload, text=tr("upload_tab"))
+        self.notebook.add(self.tab_saves, text=tr("saves_tab"))
 
         self.build_install_tab()
         self.build_mods_tab()
         self.build_upload_tab()
+        self.build_saves_tab()
 
     # ---------- INSTALL TAB ----------
     def build_install_tab(self):
@@ -1070,7 +670,6 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         f.columnconfigure(1, weight=1)
         f.rowconfigure(3, weight=1)
 
-        # Game instance row
         ttk.Label(f, text=tr("game")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.game_var = tk.StringVar()
         cur_inst = self.instance
@@ -1081,26 +680,37 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             values=self._instance_choices(), state="readonly")
         self.game_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
         self.game_combo.bind("<<ComboboxSelected>>", self._on_game_selected)
-        ttk.Button(f, text=tr("add_game"),
-                   command=self.menu_select_game).grid(row=0, column=2, padx=5, pady=5)
+        self.game_combo.bind("<Button-3>", self._on_game_right_click)
 
-        # Action buttons (auxiliary)
+        right = ttk.Frame(f)
+        right.grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        ttk.Button(right, text=tr("add_game"),
+                   command=self.menu_select_game).pack(side="left")
+        ver_btn = ttk.Button(right, text="?", width=3,
+                             command=self.show_version_dialog)
+        ver_btn.pack(side="left", padx=(4, 0))
+        # tooltip-эмуляция: текст кнопки уже самодокументирующийся,
+        # но добавим tip через title-attr нет смысла в tk; просто
+        # обновляем подсказку при наведении в lable status баре —
+        # упрощённо: bind для отображения в логе.
+        ver_btn.bind("<Enter>", lambda e: None)
+
         actions = ttk.Frame(f)
         actions.grid(row=1, column=0, columnspan=3, pady=10, sticky="ew")
-        for i, (txt, cmd) in enumerate([
-            (tr("backup"), self.create_backup),
-            (tr("restore"), self.restore_backup),
-            (tr("cleanup"), self.cleanup),
-            (tr("patch_dll"), self.patch_dll),
-            (tr("run_game"), self.run_game),
+        for i, (txt, cmd, with_ctx) in enumerate([
+            (tr("backup"), self.create_backup, False),
+            (tr("restore"), self.restore_backup, False),
+            (tr("cleanup"), self.cleanup, False),
+            (tr("run_game"), self.run_game, True),
         ]):
             actions.columnconfigure(i, weight=1)
-            ttk.Button(actions, text=txt, command=cmd).grid(
-                row=0, column=i, padx=5, sticky="ew")
+            btn = ttk.Button(actions, text=txt, command=cmd)
+            btn.grid(row=0, column=i, padx=5, sticky="ew")
+            if with_ctx:
+                btn.bind("<Button-3>", self._run_context_menu)
 
         ttk.Label(f, text=tr("log")).grid(row=2, column=0, sticky="w", padx=5, pady=(8, 0))
 
-        # Split: log | mod manager
         split = ttk.Panedwindow(f, orient="horizontal")
         split.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
 
@@ -1129,21 +739,20 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         split.add(log_frame, weight=2)
         split.add(mm, weight=1)
 
-        # Bottom strip — install buttons (use grid so они не уезжают за кадр)
         bottom = ttk.Frame(f)
         bottom.grid(row=4, column=0, columnspan=3, sticky="ew", pady=8)
         bottom.columnconfigure(0, weight=1)
-        bottom.columnconfigure(1, weight=0)
-        bottom.columnconfigure(2, weight=0)
 
         ttk.Button(bottom, text=tr("clear_log"),
                    command=self.clear_log).grid(row=0, column=0, sticky="w", padx=4)
-        ttk.Button(bottom, text=tr("install_to_game"),
-                   command=lambda: self.install_to_game(False)).grid(
-            row=0, column=1, sticky="e", padx=4)
-        ttk.Button(bottom, text=tr("install_and_run"),
-                   command=lambda: self.install_to_game(True)).grid(
-            row=0, column=2, sticky="e", padx=4)
+        b1 = ttk.Button(bottom, text=tr("install_to_game"),
+                        command=lambda: self.install_to_game(False))
+        b1.grid(row=0, column=1, sticky="e", padx=4)
+        b1.bind("<Button-3>", self._run_context_menu)
+        b2 = ttk.Button(bottom, text=tr("install_and_run"),
+                        command=lambda: self.install_to_game(True))
+        b2.grid(row=0, column=2, sticky="e", padx=4)
+        b2.bind("<Button-3>", self._run_context_menu)
 
     def _on_game_selected(self, *_):
         iid = self._instance_id_from_choice(self.game_var.get())
@@ -1153,6 +762,62 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self._ensure_clean_backup(prompt=True)
             self.refresh_mods_list()
             self.refresh_mod_manager()
+            self.refresh_saves_list()
+
+    def _on_game_right_click(self, event):
+        inst = self.instance
+        if not inst:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=tr("game_open_explorer"),
+                         command=lambda: open_path(inst["path"]))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _run_context_menu(self, event):
+        inst = self.instance
+        if not inst:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=tr("run_setup"),
+                         command=lambda: self._run_aux("setup.exe", admin=True))
+        menu.add_command(label=tr("run_mafiacon"),
+                         command=lambda: self._run_aux("MafiaCon.exe", admin=False))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _run_aux(self, exe_name, admin=False):
+        inst = self.instance
+        if not inst:
+            return
+        target = os.path.join(inst["path"], exe_name)
+        if not os.path.exists(target):
+            error_box(self, tr("error"), tr("exe_not_found").format(target))
+            return
+        try:
+            self._launch_executable(target, inst["path"], admin=admin)
+            self.log(f"Запущено: {target}")
+        except Exception as e:
+            error_box(self, tr("error"), str(e))
+
+    def _launch_executable(self, exe_path, cwd, admin=False):
+        """Запуск .exe с правильной рабочей директорией.
+        MafiaCon.exe ищет Game.exe относительно cwd; setup.exe требует UAC."""
+        if sys.platform.startswith("win"):
+            if admin:
+                import ctypes
+                ret = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", exe_path, None, cwd, 1)
+                if ret <= 32:
+                    raise RuntimeError(f"ShellExecute runas failed: {ret}")
+            else:
+                subprocess.Popen(exe_path, cwd=cwd, shell=False)
+        else:
+            subprocess.Popen([exe_path], cwd=cwd)
 
     # ---------- MODS TAB ----------
     def build_mods_tab(self):
@@ -1160,14 +825,19 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         f.columnconfigure(0, weight=1)
         f.rowconfigure(0, weight=1)
 
-        cols = ("name", "installed", "date", "files", "readme")
-        self.mods_table = ttk.Treeview(f, columns=cols, show="headings", height=15)
+        cols = ("name", "priority", "target_version", "installed", "date",
+                "files", "checksum", "readme")
+        self.mods_table = ttk.Treeview(f, columns=cols, show="headings",
+                                       height=15, selectmode="extended")
         for col_id, col_text, col_w, anchor in [
-            ("name", tr("name"), 260, "w"),
-            ("installed", tr("installed_col"), 110, "center"),
-            ("date", tr("date"), 150, "w"),
-            ("files", tr("files"), 70, "center"),
-            ("readme", tr("readme"), 240, "w"),
+            ("name", tr("name"), 220, "w"),
+            ("priority", tr("priority"), 70, "center"),
+            ("target_version", tr("target_version_col"), 90, "center"),
+            ("installed", tr("installed_col"), 90, "center"),
+            ("date", tr("date"), 140, "w"),
+            ("files", tr("files"), 60, "center"),
+            ("checksum", tr("checksum_col"), 120, "w"),
+            ("readme", tr("readme"), 180, "w"),
         ]:
             self.mods_table.heading(col_id, text=col_text)
             self.mods_table.column(col_id, width=col_w, anchor=anchor)
@@ -1176,7 +846,6 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         sb.grid(row=0, column=1, sticky="ns")
         self.mods_table.configure(yscrollcommand=sb.set)
 
-        # Bottom buttons in 2 rows so they never disappear when window narrows
         bf = ttk.Frame(f)
         bf.grid(row=1, column=0, columnspan=2, pady=8, sticky="ew")
         for i in range(4):
@@ -1185,18 +854,31 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             row=0, column=0, padx=3, sticky="ew")
         ttk.Button(bf, text=tr("rename_mod"), command=self.rename_selected_mod).grid(
             row=0, column=1, padx=3, sticky="ew")
-        ttk.Button(bf, text=tr("open_mod_folder"), command=self.open_mod_folder).grid(
+        ttk.Button(bf, text=tr("priority_change"),
+                   command=self.change_selected_priority).grid(
             row=0, column=2, padx=3, sticky="ew")
-        ttk.Button(bf, text=tr("open_readme"), command=self.open_readme_file).grid(
+        ttk.Button(bf, text=tr("open_mod_folder"), command=self.open_mod_folder).grid(
             row=0, column=3, padx=3, sticky="ew")
-        ttk.Button(bf, text=tr("create_mmi"), command=self.open_mmi_dialog).grid(
+        ttk.Button(bf, text=tr("open_readme"), command=self.open_readme_file).grid(
             row=1, column=0, padx=3, pady=(4, 0), sticky="ew")
+        ttk.Button(bf, text=tr("open_mmi_readme"),
+                   command=self.open_mmi_readme_file).grid(
+            row=1, column=1, padx=3, pady=(4, 0), sticky="ew")
+        ttk.Button(bf, text=tr("create_mmi"), command=self.open_mmi_dialog).grid(
+            row=1, column=2, padx=3, pady=(4, 0), sticky="ew")
         ttk.Button(bf, text=tr("remove_from_library"),
                    command=self.remove_selected_mod).grid(
-            row=1, column=1, padx=3, pady=(4, 0), sticky="ew")
+            row=1, column=3, padx=3, pady=(4, 0), sticky="ew")
 
         self.mods_table.bind("<Double-1>", self.open_readme_file)
         self.mods_table.bind("<Button-3>", self.show_mod_context_menu)
+
+        if DND_AVAILABLE:
+            try:
+                self.mods_table.drop_target_register(DND_FILES)
+                self.mods_table.dnd_bind("<<Drop>>", self.on_drop_to_mods)
+            except Exception:
+                pass
 
     # ---------- UPLOAD TAB ----------
     def build_upload_tab(self):
@@ -1211,12 +893,80 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             side="left", fill="x", expand=True, padx=(0, 6))
         ttk.Button(row1, text="📂 " + tr("select"),
                    command=self.select_upload).pack(side="left")
+        ttk.Button(row1, text=tr("upload_select_folder_btn"),
+                   command=self.select_upload_folder).pack(side="left", padx=4)
 
         ttk.Label(f, text=tr("upload_name")).pack(anchor="w", pady=(8, 2))
         ttk.Entry(f, textvariable=self.upload_name).pack(fill="x")
 
+        row2 = ttk.Frame(f)
+        row2.pack(fill="x", pady=(8, 2))
+        ttk.Label(row2, text=tr("upload_priority")).pack(side="left")
+        ttk.Spinbox(row2, from_=1, to=999,
+                    textvariable=self.upload_priority,
+                    width=5).pack(side="left", padx=8)
+        ttk.Label(row2, text=tr("priority_hint"),
+                  foreground="gray").pack(side="left")
+
+        # Целевая версия игры — опционально (по умолчанию игнорируется)
+        row3 = ttk.Frame(f)
+        row3.pack(fill="x", pady=(8, 2))
+        self.upload_use_target_version = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row3, text=tr("upload_target_version_check"),
+                        variable=self.upload_use_target_version,
+                        command=self._toggle_target_version_combo).pack(side="left")
+        self.upload_target_version_var = tk.StringVar(value="")
+        self.upload_target_version_combo = ttk.Combobox(
+            row3, textvariable=self.upload_target_version_var,
+            values=("",) + GAME_VERSIONS, state="disabled", width=10)
+        self.upload_target_version_combo.pack(side="left", padx=10)
+
         ttk.Button(f, text=tr("upload_btn"),
                    command=self.do_upload).pack(pady=14, anchor="w")
+
+    def _toggle_target_version_combo(self):
+        if self.upload_use_target_version.get():
+            self.upload_target_version_combo.configure(state="readonly")
+            if not self.upload_target_version_var.get():
+                self.upload_target_version_var.set("1.2")
+        else:
+            self.upload_target_version_combo.configure(state="disabled")
+            self.upload_target_version_var.set("")
+
+    # ---------- SAVES TAB ----------
+    def build_saves_tab(self):
+        f = self.tab_saves
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(2, weight=1)
+
+        ttk.Label(f, text=tr("saves_title"),
+                  font=("Arial", 13, "bold")).grid(row=0, column=0, sticky="w", pady=(2, 4))
+        ttk.Label(f, text=tr("saves_hint"),
+                  wraplength=900,
+                  foreground="gray").grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        cols = ("date", "type", "label")
+        self.saves_table = ttk.Treeview(f, columns=cols, show="headings",
+                                        height=12, selectmode="extended")
+        for col_id, col_text, col_w in [
+            ("date", tr("saves_col_date"), 200),
+            ("type", tr("saves_col_type"), 100),
+            ("label", tr("saves_col_label"), 360),
+        ]:
+            self.saves_table.heading(col_id, text=col_text)
+            self.saves_table.column(col_id, width=col_w)
+        self.saves_table.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+
+        bf = ttk.Frame(f)
+        bf.grid(row=3, column=0, sticky="ew", pady=8)
+        for i in range(3):
+            bf.columnconfigure(i, weight=1)
+        ttk.Button(bf, text=tr("saves_make_backup"),
+                   command=self.do_saves_backup).grid(row=0, column=0, padx=3, sticky="ew")
+        ttk.Button(bf, text=tr("saves_restore"),
+                   command=self.do_saves_restore).grid(row=0, column=1, padx=3, sticky="ew")
+        ttk.Button(bf, text=tr("saves_delete"),
+                   command=self.do_saves_delete).grid(row=0, column=2, padx=3, sticky="ew")
 
     # =====================================================
     # Контекстные меню
@@ -1225,7 +975,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label=tr("copy"),
                          command=lambda: self._copy_text(widget))
-        menu.add_command(label=tr("select_all"),
+        menu.add_command(label=tr("select_all_action"),
                          command=lambda: widget.tag_add("sel", "1.0", "end"))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1247,8 +997,12 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             return
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label=tr("rename_mod"), command=self.rename_selected_mod)
+        menu.add_command(label=tr("priority_change"),
+                         command=self.change_selected_priority)
         menu.add_command(label=tr("open_mod_folder"), command=self.open_mod_folder)
         menu.add_command(label=tr("open_readme"), command=self.open_readme_file)
+        menu.add_command(label=tr("open_mmi_readme"),
+                         command=self.open_mmi_readme_file)
         menu.add_command(label=tr("create_mmi"), command=self.open_mmi_dialog)
         menu.add_separator()
         menu.add_command(label=tr("remove_from_library"),
@@ -1269,27 +1023,61 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 (tr("mmi_archives"), "*.mmi"),
                 (tr("zip_archives"), "*.zip"),
                 (tr("all_files"), "*.*")])
-        if not path:
-            path = filedialog.askdirectory(parent=self, title=tr("select_mod_folder"))
+        if path:
+            self.upload_path.set(path)
+
+    def select_upload_folder(self):
+        path = filedialog.askdirectory(parent=self, title=tr("select_mod_folder"))
         if path:
             self.upload_path.set(path)
 
     def do_upload(self):
         path = self.upload_path.get()
         name = self.upload_name.get().strip() or None
+        try:
+            priority = int(self.upload_priority.get())
+            if priority < 1:
+                priority = DEFAULT_PRIORITY
+        except Exception:
+            priority = DEFAULT_PRIORITY
+        target_version = None
+        if self.upload_use_target_version.get():
+            v = (self.upload_target_version_var.get() or "").strip()
+            if v in GAME_VERSIONS:
+                target_version = v
         if not path:
             return
         try:
-            ids = add_mod_to_library(path, name=name)
+            ids, mmi_readme = add_mod_to_library(
+                path, name=name, priority=priority,
+                target_version=target_version)
             self.log(tr("upload_done") + f" ({len(ids)})")
+            if mmi_readme:
+                self._show_mmi_readme_popup(mmi_readme)
             info_box(self, tr("ok"), tr("upload_done"))
             self.upload_path.set("")
             self.upload_name.set("")
+            self.upload_priority.set(DEFAULT_PRIORITY)
+            self.upload_use_target_version.set(False)
+            self._toggle_target_version_combo()
         except zipfile.BadZipFile:
             error_box(self, tr("error"), tr("bad_archive"))
         except Exception as e:
             error_box(self, tr("error"), str(e))
         self.refresh_all()
+
+    def _show_mmi_readme_popup(self, text: str):
+        win = tk.Toplevel(self)
+        win.title(tr("import_mmi_readme_title"))
+        win.geometry("520x400")
+        win.transient(self)
+        apply_icon(win)
+        tx = tk.Text(win, wrap=tk.WORD, font=("Arial", 10))
+        tx.pack(fill="both", expand=True, padx=10, pady=10)
+        tx.insert("1.0", text)
+        tx.config(state="disabled")
+        ttk.Button(win, text=tr("ok"),
+                   command=win.destroy).pack(pady=(0, 10))
 
     def create_backup(self):
         inst = self.instance
@@ -1302,9 +1090,23 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             return
         try:
             inst_paths = get_instance_paths(inst["id"])
-            backup_path = os.path.join(inst_paths["user_backups"], slugify(name))
-            shutil.copytree(inst["path"], backup_path)
-            self.log(tr("backup_created").format(name))
+            if self.settings.get("compress_backups"):
+                level = int(self.settings.get("compress_level", 5))
+                target_zip = os.path.join(inst_paths["user_backups"],
+                                          slugify(name) + ".zip")
+                comp_arg = max(0, min(9, level))
+                with zipfile.ZipFile(target_zip, "w",
+                                     zipfile.ZIP_DEFLATED, comp_arg) as z:
+                    for root, _, files in os.walk(inst["path"]):
+                        for fname in files:
+                            full = os.path.join(root, fname)
+                            rel = os.path.relpath(full, inst["path"])
+                            z.write(full, rel)
+                self.log(tr("backup_created").format(target_zip))
+            else:
+                target_dir = os.path.join(inst_paths["user_backups"], slugify(name))
+                shutil.copytree(inst["path"], target_dir)
+                self.log(tr("backup_created").format(target_dir))
             info_box(self, tr("ok"), tr("backup_created").format(name))
         except Exception as e:
             error_box(self, tr("error"), str(e))
@@ -1313,16 +1115,33 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         inst = self.instance
         if not inst:
             return
-        path = filedialog.askdirectory(
-            parent=self,
-            initialdir=get_instance_paths(inst["id"])["user_backups"],
-            title=tr("select_backup"))
+        ub = get_instance_paths(inst["id"])["user_backups"]
+        path = filedialog.askopenfilename(
+            parent=self, initialdir=ub, title=tr("select_backup"),
+            filetypes=[(tr("zip_archives"), "*.zip"),
+                       (tr("all_files"), "*.*")])
+        if not path:
+            path = filedialog.askdirectory(parent=self, initialdir=ub,
+                                           title=tr("select_backup"))
         if not path:
             return
         if not yesno(self, tr("confirm_execute"), tr("hard_confirm")):
             return
         try:
-            hard_restore_from(path, inst["path"])
+            if os.path.isfile(path) and path.lower().endswith(".zip"):
+                for item in os.listdir(inst["path"]):
+                    full = os.path.join(inst["path"], item)
+                    try:
+                        if os.path.isfile(full) or os.path.islink(full):
+                            os.unlink(full)
+                        elif os.path.isdir(full):
+                            shutil.rmtree(full, ignore_errors=True)
+                    except Exception:
+                        pass
+                with zipfile.ZipFile(path) as z:
+                    z.extractall(inst["path"])
+            else:
+                hard_restore_from(path, inst["path"])
             self.log(tr("hard_restored") + " <- " + path)
             info_box(self, tr("ok"), tr("hard_restored"))
         except Exception as e:
@@ -1336,35 +1155,36 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             cleanup_resources(inst["path"], self.log)
             self.log(tr("cleanup_done"))
 
-    def patch_dll(self):
+    def patch_dll(self, parent=None):
         inst = self.instance
         if not inst:
             return
         src = res_path(os.path.join("assets", "rw_data.dll"))
         if not os.path.exists(src):
-            error_box(self, tr("error"), tr("patch_dll_missing"))
+            error_box(parent or self, tr("error"), tr("patch_dll_missing"))
             return
-        if not yesno(self, tr("patch_dll"),
+        if not yesno(parent or self, tr("patch_dll"),
                      tr("patch_dll_confirm").format(inst["path"])):
             return
         try:
             patch_rw_data_dll(inst["path"], self.log)
             self.log(tr("patch_dll_done"))
-            info_box(self, tr("ok"), tr("patch_dll_done"))
+            info_box(parent or self, tr("ok"), tr("patch_dll_done"))
         except Exception as e:
-            error_box(self, tr("error"), str(e))
+            error_box(parent or self, tr("error"), str(e))
 
     def run_game(self):
         inst = self.instance
         if not inst:
             return
-        exe = os.path.join(inst["path"], inst.get("exe", "Game.exe"))
-        if not os.path.exists(exe):
-            error_box(self, tr("error"), tr("exe_not_found").format(exe))
+        exe_name = inst.get("exe", "Game.exe")
+        exe_path = os.path.join(inst["path"], exe_name)
+        if not os.path.exists(exe_path):
+            error_box(self, tr("error"), tr("exe_not_found").format(exe_path))
             return
         self._maybe_update_logo()
         try:
-            subprocess.Popen(exe)
+            self._launch_executable(exe_path, inst["path"], admin=False)
         except Exception as e:
             error_box(self, tr("error"), str(e))
 
@@ -1378,7 +1198,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         active_ids = set(inst.get("active_mods", []))
         selected = [m for m in all_mods if m["id"] in active_ids]
         try:
-            update_logo_in_game(selected, inst["path"], self.log)
+            update_logo_in_game(selected, inst["path"], self.settings, self.log)
         except Exception as e:
             self.log(tr("logo_failed").format(e))
 
@@ -1390,14 +1210,60 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self._ensure_clean_backup(prompt=True)
         if not inst.get("has_clean_backup"):
             return
+
         ids = [mid for mid, var in self.mm_vars.items() if var.get()]
         all_mods = load_json(PATHS["mods_json"], [])
         selected = [m for m in all_mods if m["id"] in ids]
+
+        if (self.settings.get("recommended_count_on", True)
+                and len(selected) > self.settings.get(
+                    "recommended_count", DEFAULT_RECOMMENDED_COUNT)):
+            if not yesno(self, tr("install_to_game"),
+                         tr("mod_recommended_warn").format(
+                             len(selected),
+                             self.settings.get("recommended_count",
+                                               DEFAULT_RECOMMENDED_COUNT))):
+                return
+
+        with_saves = [m for m in selected if mod_has_saves(m)]
+        if with_saves:
+            names = ", ".join(m.get("name") or m["id"] for m in with_saves)
+            if not yesno(self, tr("install_to_game"),
+                         tr("mod_saves_warn").format(names)):
+                return
+
+        # Проверка соответствия версий: только пишем в лог, не блокируем
+        game_info = detect_game_version(inst["path"])
+        game_v = game_info.get("version")
+        if game_v:
+            for m in selected:
+                mv = (m.get("target_version") or "").strip()
+                if mv and mv != game_v:
+                    self.log(tr("version_mismatch_log").format(
+                        m.get("name") or m["id"], mv, game_v))
+
+        # Auto-бэкап savegame перед установкой (только если включено)
+        if self.settings.get("auto_backup_saves", True):
+            try:
+                sid = make_saves_backup(inst, type_="auto",
+                                        label="before-install")
+                if not sid:
+                    self.log("savegame/ не найдена в папке игры — "
+                             "авто-бэкап пропущен")
+            except Exception as e:
+                self.log(f"Авто-бэкап savegame не удался: {e}")
+        else:
+            self.log(tr("auto_backup_off_log"))
+
         try:
-            install_mods_into_game(selected, inst, self.log)
+            install_mods_into_game(selected, inst, self.settings, self.log)
             self.log(tr("install_to_game_complete"))
             self.instances = load_json(PATHS["instances_json"], [])
             self.refresh_mods_list()
+            self.refresh_saves_list()
+            # Логотип формируется СРАЗУ после установки — иначе при первом
+            # запуске игры пользователь увидит ванильный logo1.avi.
+            self._maybe_update_logo()
             if run_after:
                 self.run_game()
             else:
@@ -1409,7 +1275,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         self.logbox.delete("1.0", tk.END)
 
     # =====================================================
-    # Список модов / mod manager
+    # Refresh
     # =====================================================
     def refresh_all(self):
         if hasattr(self, "game_combo"):
@@ -1419,6 +1285,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 self.game_var.set(f"{cur['name']}  ({cur['path']})")
         self.refresh_mods_list()
         self.refresh_mod_manager()
+        self.refresh_saves_list()
 
     def refresh_mods_list(self):
         if not hasattr(self, "mods_table"):
@@ -1433,11 +1300,17 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             readme_str = ", ".join(os.path.relpath(r, mod.get("dir", ""))
                                    for r in readmes)
             mark = "✓" if mod["id"] in active_ids else "✗"
-            self.mods_table.insert("", "end", values=(
+            cs = (mod.get("checksum") or "")[:12]
+            tv = mod.get("target_version") or tr("any_version")
+            # iid = mod_id чтобы multi-select давал нам id-ы
+            self.mods_table.insert("", "end", iid=mod["id"], values=(
                 mod.get("name", ""),
+                mod.get("priority", DEFAULT_PRIORITY),
+                tv,
                 mark,
                 mod.get("date", ""),
                 mod.get("files_count", 0),
+                cs,
                 readme_str,
             ))
 
@@ -1449,21 +1322,44 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         self.mm_vars = {}
         inst = self.instance
         active_ids = set(inst.get("active_mods", [])) if inst else set()
-        for mod in load_json(PATHS["mods_json"], []):
+        for mod in sorted(load_json(PATHS["mods_json"], []),
+                          key=lambda m: int(m.get("priority", DEFAULT_PRIORITY))):
             v = tk.BooleanVar(value=mod["id"] in active_ids)
             self.mm_vars[mod["id"]] = v
-            ttk.Checkbutton(self.mm_inner,
-                            text=mod.get("name", mod["id"]),
+            label = (mod.get("name") or mod["id"]) + \
+                    f"  [p{mod.get('priority', DEFAULT_PRIORITY)}]"
+            ttk.Checkbutton(self.mm_inner, text=label,
                             variable=v).pack(anchor="w", padx=6, pady=2)
 
+    def refresh_saves_list(self):
+        if not hasattr(self, "saves_table"):
+            return
+        for row in self.saves_table.get_children():
+            self.saves_table.delete(row)
+        inst = self.instance
+        if not inst:
+            return
+        for s in reversed(inst.get("saves", [])):
+            type_ = s.get("type", "manual")
+            type_str = tr(f"saves_type_{type_}")
+            self.saves_table.insert("", "end", iid=s["id"],
+                                    values=(s.get("date", ""),
+                                            type_str,
+                                            s.get("label", "")))
+
     def get_selected_mod(self):
-        sel = self.mods_table.selection()
-        if not sel:
+        """Возвращает первый выделенный мод (для одиночных операций)."""
+        ids = self.mods_table.selection()
+        if not ids:
             return None
-        idx = self.mods_table.index(sel[0])
-        if 0 <= idx < len(self.mods_data):
-            return self.mods_data[idx]
-        return None
+        by_id = {m["id"]: m for m in self.mods_data}
+        return by_id.get(ids[0])
+
+    def get_selected_mods(self):
+        """Возвращает список всех выделенных модов (для multi-select)."""
+        ids = self.mods_table.selection()
+        by_id = {m["id"]: m for m in self.mods_data}
+        return [by_id[i] for i in ids if i in by_id]
 
     def rename_selected_mod(self):
         mod = self.get_selected_mod()
@@ -1473,17 +1369,37 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                                      initialvalue=mod.get("name", ""), parent=self)
         if new is None or not new.strip():
             return
-        rename_mod(mod["id"], new.strip())
+        update_mod_field(mod["id"], "name", new.strip())
         self.refresh_all()
 
-    def remove_selected_mod(self):
+    def change_selected_priority(self):
         mod = self.get_selected_mod()
         if not mod:
             return
-        if not yesno(self, tr("remove_from_library"),
-                     tr("remove_confirm").format(mod.get("name", mod["id"]))):
+        new = simpledialog.askinteger(
+            tr("priority_change"), tr("priority_hint"),
+            initialvalue=int(mod.get("priority", DEFAULT_PRIORITY)),
+            minvalue=1, maxvalue=9999, parent=self)
+        if new is None:
             return
-        remove_mod_from_library(mod["id"])
+        update_mod_field(mod["id"], "priority", int(new))
+        self.refresh_all()
+
+    def remove_selected_mod(self):
+        mods = self.get_selected_mods()
+        if not mods:
+            return
+        if len(mods) == 1:
+            m = mods[0]
+            if not yesno(self, tr("remove_from_library"),
+                         tr("remove_confirm").format(m.get("name", m["id"]))):
+                return
+        else:
+            if not yesno(self, tr("remove_from_library"),
+                         tr("delete_multiple_confirm").format(len(mods))):
+                return
+        for m in mods:
+            remove_mod_from_library(m["id"])
         self.refresh_all()
 
     def open_mod_folder(self):
@@ -1499,7 +1415,121 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         if not readmes:
             info_box(self, tr("info"), "Readme not found")
             return
-        open_path(readmes[0])
+        if len(readmes) == 1:
+            open_path(readmes[0])
+            return
+        # Несколько readme — диалог выбора
+        self._show_readme_picker(mod, readmes)
+
+    def _show_readme_picker(self, mod, readmes):
+        win = tk.Toplevel(self)
+        win.title(tr("multi_readme_title"))
+        win.geometry("520x340")
+        win.transient(self)
+        apply_icon(win)
+
+        ttk.Label(win, text=mod.get("name", ""),
+                  font=("Arial", 11, "bold")).pack(anchor="w", padx=12,
+                                                   pady=(10, 6))
+
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=4)
+        lst = tk.Listbox(list_frame, height=8, activestyle="dotbox")
+        lst.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=lst.yview)
+        sb.pack(side="right", fill="y")
+        lst.configure(yscrollcommand=sb.set)
+
+        mod_dir = mod.get("dir", "")
+        for r in readmes:
+            lst.insert(tk.END, os.path.relpath(r, mod_dir))
+
+        def _open_selected():
+            sel = lst.curselection()
+            if not sel:
+                return
+            open_path(readmes[sel[0]])
+            win.destroy()
+
+        lst.bind("<Double-1>", lambda e: _open_selected())
+
+        bar = ttk.Frame(win)
+        bar.pack(side="bottom", fill="x", pady=10)
+        ttk.Button(bar, text=tr("close"),
+                   command=win.destroy).pack(side="right", padx=10)
+        ttk.Button(bar, text=tr("open_readme"),
+                   command=_open_selected).pack(side="right", padx=4)
+
+    def open_mmi_readme_file(self):
+        mod = self.get_selected_mod()
+        if not mod:
+            return
+        text = mod.get("mmi_readme", "")
+        if not text:
+            info_box(self, tr("info"), tr("no_mmi_readme"))
+            return
+        self._show_mmi_readme_popup(text)
+
+    # =====================================================
+    # Saves actions
+    # =====================================================
+    def do_saves_backup(self):
+        inst = self.instance
+        if not inst:
+            return
+        if not os.path.isdir(saves_folder(inst)):
+            info_box(self, tr("info"), tr("saves_folder_missing"))
+            return
+        label = simpledialog.askstring(tr("saves_make_backup"),
+                                       tr("saves_label"), parent=self) or ""
+        try:
+            sid = make_saves_backup(inst, type_="manual", label=label)
+            if sid:
+                self.log(tr("saves_done"))
+                self.refresh_saves_list()
+            else:
+                info_box(self, tr("info"), tr("saves_folder_missing"))
+        except Exception as e:
+            error_box(self, tr("error"), str(e))
+
+    def do_saves_restore(self):
+        inst = self.instance
+        if not inst:
+            return
+        if self.settings.get("immutable_saves", True):
+            error_box(self, tr("error"), tr("saves_immutable_off"))
+            return
+        sel = self.saves_table.selection()
+        if not sel:
+            info_box(self, tr("info"), tr("saves_no_select"))
+            return
+        sid = sel[0]
+        if not yesno(self, tr("saves_restore"), tr("confirm_execute")):
+            return
+        try:
+            restore_saves_backup(inst, sid)
+            self.log(tr("saves_restored"))
+            info_box(self, tr("ok"), tr("saves_restored"))
+        except Exception as e:
+            error_box(self, tr("error"), str(e))
+
+    def do_saves_delete(self):
+        inst = self.instance
+        if not inst:
+            return
+        sel = list(self.saves_table.selection())
+        if not sel:
+            info_box(self, tr("info"), tr("saves_no_select"))
+            return
+        if len(sel) == 1:
+            if not yesno(self, tr("saves_delete"), tr("confirm_execute")):
+                return
+        else:
+            if not yesno(self, tr("saves_delete"),
+                         tr("delete_multiple_confirm").format(len(sel))):
+                return
+        delete_saves_backups(inst, sel)
+        self.refresh_saves_list()
 
     # =====================================================
     # MMI dialog
@@ -1507,8 +1537,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def open_mmi_dialog(self):
         win = tk.Toplevel(self)
         win.title(tr("mmi_dialog_title"))
-        win.geometry("540x520")
-        win.minsize(460, 360)
+        win.geometry("620x640")
+        win.minsize(500, 460)
         win.transient(self)
         apply_icon(win)
 
@@ -1546,18 +1576,52 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 ttk.Checkbutton(inner, text=label,
                                 variable=v).pack(anchor="w", pady=2)
 
+        def select_all_action():
+            for m in all_mods:
+                v = vars_map.setdefault(m["id"], tk.BooleanVar())
+                v.set(True)
+            render()
+
+        ttk.Button(bar, text=tr("mmi_select_all"),
+                   command=select_all_action).pack(side="left", padx=4)
+
         search_var.trace_add("write", lambda *_: render())
         render()
+
+        # Целевая версия (применяется ко всем выбранным модам при упаковке)
+        tv_row = ttk.Frame(win)
+        tv_row.pack(fill="x", padx=12, pady=(6, 2))
+        ttk.Label(tv_row, text=tr("target_version") + ":").pack(side="left")
+        mmi_target_var = tk.StringVar(value="")
+        ttk.Combobox(tv_row, textvariable=mmi_target_var,
+                     values=("",) + GAME_VERSIONS, state="readonly",
+                     width=10).pack(side="left", padx=6)
+        ttk.Label(tv_row, text=tr("any_version"),
+                  foreground="gray").pack(side="left")
+
+        ttk.Label(win, text=tr("mmi_readme_label")).pack(
+            anchor="w", padx=12, pady=(8, 2))
+        readme_text = tk.Text(win, height=5, wrap=tk.WORD)
+        readme_text.pack(fill="x", padx=12, pady=2)
 
         bbar = ttk.Frame(win)
         bbar.pack(fill="x", side="bottom", pady=10)
 
         def do_save():
             chosen_ids = {mid for mid, v in vars_map.items() if v.get()}
-            chosen = [m for m in all_mods if m["id"] in chosen_ids]
+            chosen = [dict(m) for m in all_mods if m["id"] in chosen_ids]
             if not chosen:
                 info_box(win, tr("info"), tr("no_mods_selected"))
                 return
+            mmi_readme = readme_text.get("1.0", "end-1c")
+            if len(mmi_readme) > MMI_README_LIMIT:
+                error_box(win, tr("error"), tr("mmi_too_long"))
+                return
+            # Переопределяем target_version у выбранных модов, если задан в форме
+            tv = (mmi_target_var.get() or "").strip()
+            if tv:
+                for m in chosen:
+                    m["target_version"] = tv
             out = filedialog.asksaveasfilename(
                 parent=win, title=tr("mmi_save"),
                 defaultextension=".mmi",
@@ -1566,7 +1630,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             if not out:
                 return
             try:
-                build_mmi(chosen, out)
+                build_mmi(chosen, out, mmi_readme=mmi_readme)
                 win.destroy()
                 info_box(self, tr("ok"), out)
             except Exception as e:
@@ -1583,7 +1647,19 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def on_drop(self, event):
         path = event.data.strip("{}").strip()
         if path:
-            self.upload_path.set(path)
+            self._dropped_to_upload(path)
+
+    def on_drop_to_mods(self, event):
+        path = event.data.strip("{}").strip()
+        if path:
+            self._dropped_to_upload(path)
+
+    def _dropped_to_upload(self, path: str):
+        self.upload_path.set(path)
+        try:
+            self.notebook.select(self.tab_upload)
+        except Exception:
+            pass
 
 
 # =========================================================
