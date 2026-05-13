@@ -4,6 +4,9 @@
 Univerzalni instalator modu pro **Mafia: The City of Lost Heaven**  
 A universal mod installer for **Mafia: The City of Lost Heaven**
 
+<img width="714" height="470" alt="image" src="https://github.com/user-attachments/assets/d2a93133-c610-4572-aee5-6a370c4de0ec" />
+
+
 ## Содержание / Obsah / Table of contents
 
 - [Быстрый старт / Rychly start / Quick start](#быстрый-старт--rychly-start--quick-start)
