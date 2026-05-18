@@ -16,6 +16,7 @@
 #   mmi_gui.py         — иконки и обёртки messagebox
 # =========================================================
 
+import datetime
 import os
 import subprocess
 import sys
@@ -37,13 +38,16 @@ from mmi_paths import (PATHS, DATA, APP_NAME, APP_VERSION,
                        DEFAULT_SETTINGS, DEFAULT_PRIORITY,
                        DEFAULT_RECOMMENDED_COUNT, MMI_README_LIMIT,
                        GAME_VERSIONS, res_path)
-from mmi_lang import (LANGS, load_languages, detect_lang, set_lang, tr)
+from mmi_lang import (LANGS, load_languages, detect_lang, set_lang, tr,
+                       add_language_file)
 from mmi_utils import (load_json, save_json, slugify, open_path,
                        detect_steam_path, find_readmes, append_log, now)
 from mmi_mods import (add_mod_to_library, remove_mod_from_library,
                       update_mod_field, build_mmi, mod_has_saves)
 from mmi_instances import (get_instance_paths, find_instance,
-                           upsert_instance, update_instance)
+                           upsert_instance, update_instance,
+                           estimate_clean_backup_size_bytes,
+                           forget_instance)
 from mmi_installer import (cleanup_resources, hard_restore_from,
                            install_mods_into_game, patch_rw_data_dll)
 from mmi_saves import (make_saves_backup, restore_saves_backup,
@@ -51,8 +55,16 @@ from mmi_saves import (make_saves_backup, restore_saves_backup,
                        saves_folder)
 from mmi_logo import update_logo_in_game, clear_logo_cache
 from mmi_service import (revert_all_instances, revert_one_instance,
-                         find_duplicate_mods, troubleshoot_scope)
-from mmi_version import detect_game_version, is_rw_data_patched
+                         find_duplicate_mods, troubleshoot_scope,
+                         build_troubleshooter_report)
+from mmi_version import (detect_game_version, is_rw_data_patched,
+                          detect_widescreen_fix, is_mafia_game_folder)
+from mmi_dta import (compute_dtas_for_dirs, extract_dtas,
+                     is_available as dta_cli_available)
+from mmi_cache import (cache_sounds_from_folder, apply_sounds_cache,
+                       cache_status as sounds_cache_status,
+                       clear_cache as sounds_clear_cache)
+from mmi_finder import scan as scan_for_games
 from mmi_gui import apply_icon, info_box, error_box, yesno, yesnocancel
 
 
@@ -98,6 +110,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self.current_instance_id = None
 
         self._first_launch_check()
+        self._auto_widescreen_detect()
         self.create_menu()
         self.create_ui()
 
@@ -113,6 +126,27 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     @property
     def instance(self):
         return find_instance(self.instances, self.current_instance_id)
+
+    def _auto_widescreen_detect(self):
+        """Если включено `auto_widescreen_detect`, и в ХОТЯ БЫ одном
+        зарегистрированном экземпляре найден Mafia.WidescreenFix —
+        автоматически включаем настройку `widescreen` (использовать
+        widescreen-фикс при построении логотипа). Если нет ни в одном —
+        не трогаем выбор пользователя.
+        """
+        if not self.settings.get("auto_widescreen_detect", True):
+            return
+        any_found = False
+        for inst in self.instances:
+            try:
+                if detect_widescreen_fix(inst.get("path", ""))["present"]:
+                    any_found = True
+                    break
+            except Exception:
+                continue
+        if any_found and not self.settings.get("widescreen", False):
+            self.settings["widescreen"] = True
+            self.save_cfg()
 
     def save_cfg(self):
         from mmi_lang import LANG
@@ -134,59 +168,74 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         if not self.cfg.get("launched"):
             self.cfg["launched"] = True
             self.save_cfg()
-        if self.instance:
-            self._ensure_clean_backup(prompt=False)
+        inst = self.instance
+        if not inst:
+            return
+        # Свежий, ни разу не виденный экземпляр (нет clean_backup и нет
+        # отметки pending) — это первый показ, спрашиваем сразу.
+        # Иначе — тихо обновляем флаг has_clean_backup, если бэкап успели
+        # сделать снаружи.
+        first_seen = (not inst.get("has_clean_backup")
+                      and not inst.get("pending_clean_backup"))
+        self._ensure_clean_backup(prompt=first_seen)
+
+    def _human_bytes(self, n: int) -> str:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024 or unit == "TB":
+                return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+            n /= 1024.0
+        return f"{n:.1f} TB"
+
+    def _make_clean_backup_now(self, inst: dict) -> bool:
+        """Создаёт clean_backup. Возвращает True/False."""
+        clean = get_instance_paths(inst["id"])["clean"]
+        try:
+            if os.path.isdir(clean):
+                shutil.rmtree(clean, ignore_errors=True)
+            shutil.copytree(inst["path"], clean)
+            inst["has_clean_backup"] = True
+            inst["pending_clean_backup"] = False
+            update_instance(inst)
+            self._log_safe(tr("clean_backup_created"))
+            return True
+        except Exception as e:
+            error_box(self, tr("error"), str(e))
+            return False
 
     def _ensure_clean_backup(self, prompt=True):
+        """Проверяет/создаёт clean_backup для текущего экземпляра.
+
+        Поведение v0.16:
+          • Если clean_backup уже есть — отмечаем флаг и выходим.
+          • Если нет и prompt=True — показываем диалог OK / Позже с
+            оценкой размера. OK → делаем сразу, Позже → ставим флаг
+            `pending_clean_backup=True`; install_to_game повторно
+            спросит. Без prompt — просто ставим флаг pending.
+        """
         inst = self.instance
         if not inst or not os.path.isdir(inst["path"]):
             return
         clean = get_instance_paths(inst["id"])["clean"]
         if os.path.isdir(clean) and os.listdir(clean):
             inst["has_clean_backup"] = True
+            inst["pending_clean_backup"] = False
             update_instance(inst)
             return
 
-        if not inst.get("has_clean_backup"):
-            try:
-                shutil.copytree(inst["path"], clean)
-                inst["has_clean_backup"] = True
-                update_instance(inst)
-                self._log_safe(tr("clean_backup_created"))
-                return
-            except Exception as e:
-                self._log_safe(f"Auto clean backup failed: {e}")
-
         if not prompt:
+            inst["pending_clean_backup"] = True
+            update_instance(inst)
             return
 
-        choice = yesnocancel(
-            self, tr("no_clean_backup_title"),
-            tr("no_clean_backup_msg") + "\n\n"
-            f"Yes = {tr('btn_make_clean')}, No = {tr('btn_pick_clean')}, Cancel = {tr('btn_skip')}")
-        if choice is None:
-            return
-        if choice:
-            try:
-                if os.path.isdir(clean):
-                    shutil.rmtree(clean, ignore_errors=True)
-                shutil.copytree(inst["path"], clean)
-                inst["has_clean_backup"] = True
-                update_instance(inst)
-                info_box(self, tr("info"), tr("clean_backup_created"))
-            except Exception as e:
-                error_box(self, tr("error"), str(e))
+        size = estimate_clean_backup_size_bytes(inst["path"])
+        msg = tr("clean_backup_required_msg").format(self._human_bytes(size))
+        if yesno(self, tr("clean_backup_required_title"), msg,
+                 yes_text=tr("ok"), no_text=tr("btn_later")):
+            self._make_clean_backup_now(inst)
         else:
-            picked = filedialog.askdirectory(parent=self, title=tr("btn_pick_clean"))
-            if picked:
-                try:
-                    if os.path.isdir(clean):
-                        shutil.rmtree(clean, ignore_errors=True)
-                    shutil.copytree(picked, clean)
-                    inst["has_clean_backup"] = True
-                    update_instance(inst)
-                except Exception as e:
-                    error_box(self, tr("error"), str(e))
+            inst["pending_clean_backup"] = True
+            update_instance(inst)
+            self._log_safe(tr("clean_backup_postponed"))
 
     # =====================================================
     # Меню
@@ -218,8 +267,9 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         menubar.add_cascade(label=tr("menu_help"), menu=m_help)
 
         m_about = tk.Menu(menubar, tearoff=0)
+        # «О программе» в v0.16 переоткрывает help.html (по промпту).
         m_about.add_command(label=tr("menu_about"),
-                            command=self.open_about_dialog)
+                            command=self.open_help)
         menubar.add_cascade(label=tr("menu_about"), menu=m_about)
 
         self.config(menu=menubar)
@@ -305,6 +355,11 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         v_conflict = tk.BooleanVar(value=s.get("conflict_check", False))
         v_immutable = tk.BooleanVar(value=s.get("immutable_saves", True))
         v_auto_backup = tk.BooleanVar(value=s.get("auto_backup_saves", True))
+        v_autodetect_tv = tk.BooleanVar(
+            value=s.get("experimental_autodetect_target_version", False))
+        v_alt_logo = tk.BooleanVar(value=s.get("use_alt_logo", False))
+        v_auto_ws = tk.BooleanVar(
+            value=s.get("auto_widescreen_detect", True))
         v_recommend_on = tk.BooleanVar(value=s.get("recommended_count_on", True))
         v_recommend_n = tk.IntVar(
             value=s.get("recommended_count", DEFAULT_RECOMMENDED_COUNT))
@@ -322,6 +377,13 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                         variable=v_immutable).pack(anchor="w", pady=4)
         ttk.Checkbutton(body, text=tr("settings_auto_backup_saves"),
                         variable=v_auto_backup).pack(anchor="w", pady=4)
+        ttk.Checkbutton(
+            body, text=tr("settings_experimental_autodetect_target_version"),
+            variable=v_autodetect_tv).pack(anchor="w", pady=4)
+        ttk.Checkbutton(body, text=tr("settings_use_alt_logo"),
+                        variable=v_alt_logo).pack(anchor="w", pady=4)
+        ttk.Checkbutton(body, text=tr("settings_auto_widescreen_detect"),
+                        variable=v_auto_ws).pack(anchor="w", pady=4)
 
         rcrow = ttk.Frame(body)
         rcrow.pack(anchor="w", pady=6, fill="x")
@@ -364,6 +426,9 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self.settings["conflict_check"] = v_conflict.get()
             self.settings["immutable_saves"] = v_immutable.get()
             self.settings["auto_backup_saves"] = v_auto_backup.get()
+            self.settings["experimental_autodetect_target_version"] = v_autodetect_tv.get()
+            self.settings["use_alt_logo"] = v_alt_logo.get()
+            self.settings["auto_widescreen_detect"] = v_auto_ws.get()
             self.settings["recommended_count_on"] = v_recommend_on.get()
             try:
                 self.settings["recommended_count"] = max(
@@ -387,7 +452,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def open_service_dialog(self):
         win = tk.Toplevel(self)
         win.title(tr("service_title"))
-        win.geometry("560x340")
+        win.geometry("560x520")
         win.transient(self)
         apply_icon(win)
 
@@ -396,16 +461,26 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         ttk.Button(body, text=tr("service_revert_one"),
                    command=lambda: self._service_revert_one(win)).pack(
-            fill="x", pady=6)
+            fill="x", pady=4)
         ttk.Button(body, text=tr("service_revert_all"),
                    command=lambda: self._service_revert_all(win)).pack(
-            fill="x", pady=6)
+            fill="x", pady=4)
         ttk.Button(body, text=tr("service_find_dupes"),
                    command=lambda: self._service_find_dupes(win)).pack(
-            fill="x", pady=6)
+            fill="x", pady=4)
         ttk.Button(body, text=tr("service_troubleshoot"),
                    command=lambda: self._service_troubleshoot(win)).pack(
-            fill="x", pady=6)
+            fill="x", pady=4)
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Button(body, text=tr("service_instance_finder"),
+                   command=lambda: self._service_instance_finder(win)).pack(
+            fill="x", pady=4)
+        ttk.Button(body, text=tr("service_manage_instances"),
+                   command=lambda: self._service_manage_instances(win)).pack(
+            fill="x", pady=4)
+        ttk.Button(body, text=tr("service_cache_sounds"),
+                   command=lambda: self._service_cache_sounds(win)).pack(
+            fill="x", pady=4)
         ttk.Button(body, text=tr("close"),
                    command=win.destroy).pack(side="bottom", pady=10)
 
@@ -536,10 +611,399 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             if any_issue:
                 _print("\n" + tr("ts_help_links"))
 
-        ttk.Button(body, text=tr("ts_run"), command=_run).pack(
-            anchor="e", pady=(4, 0))
-        ttk.Button(body, text=tr("close"), command=win.destroy).pack(
-            anchor="e", pady=(4, 0))
+        last_ctx = {"scope": None, "mod_id": None}
+
+        def _run_and_track():
+            inst = self.instance
+            scope = scope_var.get()
+            mod_id = None
+            if scope == "one_mod":
+                name = mod_var.get()
+                target = next((m for m in all_mods
+                               if (m.get("name") or m["id"]) == name), None)
+                if target:
+                    mod_id = target["id"]
+            last_ctx["scope"] = scope
+            last_ctx["mod_id"] = mod_id
+            _run()
+
+        def _build_report_text():
+            if not last_ctx["scope"]:
+                _run_and_track()
+            return build_troubleshooter_report(
+                last_ctx["scope"], last_ctx["mod_id"], self.instance)
+
+        def _save_report():
+            text = _build_report_text()
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                parent=win, title=tr("ts_report_btn"),
+                defaultextension=".txt",
+                initialfile=f"mmi_report_{ts}.txt",
+                filetypes=[("Text files", "*.txt")])
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                info_box(win, tr("ok"),
+                         tr("ts_report_saved").format(path))
+            except Exception as e:
+                error_box(win, tr("error"), str(e))
+
+        def _copy_report():
+            text = _build_report_text()
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            info_box(win, tr("ok"), tr("ts_report_copied"))
+
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Button(row, text=tr("ts_run"),
+                   command=_run_and_track).pack(side="left", padx=2)
+        ttk.Button(row, text=tr("ts_report_btn"),
+                   command=_save_report).pack(side="left", padx=2)
+        ttk.Button(row, text=tr("ts_report_clipboard"),
+                   command=_copy_report).pack(side="left", padx=2)
+        ttk.Button(row, text=tr("close"),
+                   command=win.destroy).pack(side="right", padx=2)
+
+    # ---------- Instance Finder ----------
+    def _service_instance_finder(self, parent):
+        win = tk.Toplevel(parent)
+        win.title(tr("service_instance_finder"))
+        win.geometry("780x560")
+        win.transient(parent)
+        apply_icon(win)
+
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text=tr("finder_hint"),
+                  wraplength=720, foreground="gray").pack(
+            anchor="w", pady=(0, 8))
+
+        mode_var = tk.StringVar(value="auto")
+        modes = ttk.Frame(body)
+        modes.pack(anchor="w", pady=4)
+        ttk.Radiobutton(modes, text=tr("finder_mode_auto"),
+                        variable=mode_var, value="auto").pack(
+            side="left", padx=4)
+        ttk.Radiobutton(modes, text=tr("finder_mode_full"),
+                        variable=mode_var, value="full").pack(
+            side="left", padx=4)
+        ttk.Radiobutton(modes, text=tr("finder_mode_selective"),
+                        variable=mode_var, value="selective").pack(
+            side="left", padx=4)
+
+        log_frame = ttk.LabelFrame(body, text=tr("finder_log"))
+        log_frame.pack(fill="both", expand=True, pady=8)
+        log_box = tk.Text(log_frame, height=8, wrap=tk.WORD)
+        log_box.pack(fill="both", expand=True, padx=4, pady=4)
+        log_box.config(state="disabled")
+
+        def log(line):
+            log_box.config(state="normal")
+            log_box.insert(tk.END, line + "\n")
+            log_box.config(state="disabled")
+            log_box.see(tk.END)
+            win.update_idletasks()
+
+        result_frame = ttk.LabelFrame(body, text=tr("finder_results"))
+        result_frame.pack(fill="both", expand=True, pady=8)
+        cols = ("name", "version", "path")
+        tree = ttk.Treeview(result_frame, columns=cols, show="headings",
+                            height=6, selectmode="browse")
+        for cid, txt, w in [("name", tr("finder_col_name"), 160),
+                            ("version", tr("game_version_title"), 80),
+                            ("path", tr("finder_col_path"), 480)]:
+            tree.heading(cid, text=txt)
+            tree.column(cid, width=w)
+        tree.pack(fill="both", expand=True, padx=4, pady=4)
+
+        found = []  # list of dicts
+
+        def populate():
+            for r in tree.get_children():
+                tree.delete(r)
+            for i, g in enumerate(found):
+                tree.insert("", "end", iid=str(i),
+                            values=(g["name"], g["version"], g["path"]))
+
+        def start_scan():
+            log_box.config(state="normal")
+            log_box.delete("1.0", tk.END)
+            log_box.config(state="disabled")
+            found.clear()
+            populate()
+            mode = mode_var.get()
+            custom = ""
+            if mode == "selective":
+                custom = filedialog.askdirectory(parent=win,
+                                                 title=tr("finder_pick_dir"))
+                if not custom:
+                    return
+            try:
+                results = scan_for_games(mode, custom_path=custom, on_log=log)
+            except Exception as e:
+                error_box(win, tr("error"), str(e))
+                return
+            found.extend(results)
+            populate()
+            log(tr("finder_done").format(len(results)))
+
+        def open_folder():
+            sel = tree.selection()
+            if not sel:
+                return
+            g = found[int(sel[0])]
+            open_path(g["path"])
+
+        def add_instance():
+            sel = tree.selection()
+            if not sel:
+                return
+            g = found[int(sel[0])]
+            inst = upsert_instance(g["path"])
+            self.instances = load_json(PATHS["instances_json"], [])
+            self.current_instance_id = inst["id"]
+            self.save_cfg()
+            self.refresh_all()
+            # Триггерим диалог OK / Позже (пункт 4 промпта)
+            self._ensure_clean_backup(prompt=True)
+            info_box(win, tr("ok"),
+                     tr("finder_added").format(g["path"]))
+
+        bf = ttk.Frame(body)
+        bf.pack(fill="x", pady=(6, 0))
+        ttk.Button(bf, text=tr("finder_start"),
+                   command=start_scan).pack(side="left", padx=4)
+        ttk.Button(bf, text=tr("finder_open_folder"),
+                   command=open_folder).pack(side="left", padx=4)
+        ttk.Button(bf, text=tr("finder_add_instance"),
+                   command=add_instance).pack(side="left", padx=4)
+        ttk.Button(bf, text=tr("close"),
+                   command=win.destroy).pack(side="right", padx=4)
+
+    # ---------- Manage Instances ----------
+    def _service_manage_instances(self, parent):
+        win = tk.Toplevel(parent)
+        win.title(tr("service_manage_instances"))
+        win.geometry("760x440")
+        win.transient(parent)
+        apply_icon(win)
+
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+
+        cols = ("name", "version", "path")
+        tree = ttk.Treeview(body, columns=cols, show="headings",
+                            height=10, selectmode="browse")
+        for cid, txt, w in [("name", tr("finder_col_name"), 160),
+                            ("version", tr("game_version_title"), 80),
+                            ("path", tr("finder_col_path"), 480)]:
+            tree.heading(cid, text=txt)
+            tree.column(cid, width=w)
+        tree.pack(fill="both", expand=True, pady=4)
+
+        def populate():
+            for r in tree.get_children():
+                tree.delete(r)
+            for inst in self.instances:
+                v = detect_game_version(inst.get("path", "")).get("version") \
+                    or "?"
+                tree.insert("", "end", iid=inst["id"],
+                            values=(inst.get("name", inst["id"]), v,
+                                    inst.get("path", "")))
+
+        def get_selected():
+            sel = tree.selection()
+            if not sel:
+                return None
+            return find_instance(self.instances, sel[0])
+
+        def do_open():
+            inst = get_selected()
+            if not inst:
+                return
+            open_path(inst.get("path", ""))
+
+        def do_check_version():
+            inst = get_selected()
+            if not inst:
+                return
+            info = detect_game_version(inst.get("path", ""))
+            ver = info.get("version") or tr("game_version_unknown")
+            info_box(win, tr("game_version_title"),
+                     f"{inst.get('name')}: {ver}\n{inst.get('path', '')}")
+
+        def do_forget():
+            inst = get_selected()
+            if not inst:
+                return
+            if not yesno(win, tr("service_manage_instances"),
+                         tr("manage_forget_confirm").format(
+                             inst.get("name", inst["id"]))):
+                return
+            if forget_instance(inst["id"]):
+                self.instances = load_json(PATHS["instances_json"], [])
+                if self.current_instance_id == inst["id"]:
+                    self.current_instance_id = (
+                        self.instances[0]["id"] if self.instances else None)
+                    self.save_cfg()
+                self.refresh_all()
+                populate()
+                info_box(win, tr("ok"),
+                         tr("manage_forgotten").format(
+                             inst.get("name", inst["id"])))
+
+        bf = ttk.Frame(body)
+        bf.pack(fill="x", pady=8)
+        ttk.Button(bf, text=tr("manage_open_path"),
+                   command=do_open).pack(side="left", padx=4)
+        ttk.Button(bf, text=tr("manage_check_version"),
+                   command=do_check_version).pack(side="left", padx=4)
+        ttk.Button(bf, text=tr("manage_forget"),
+                   command=do_forget).pack(side="left", padx=4)
+        ttk.Button(bf, text=tr("close"),
+                   command=win.destroy).pack(side="right", padx=4)
+
+        populate()
+
+    # ---------- Cache Sounds ----------
+    def _service_cache_sounds(self, parent):
+        """Кэширование папки sounds/ во внутренний кэш MMI и применение
+        к выбранному экземпляру.
+
+        Это НЕ распаковка .dta — у лицензий вырезанные треки изначально
+        отсутствуют в файлах игры, поэтому распаковывать нечего.
+        Нужен внешний источник (диск, старая инсталляция, бэкап).
+        """
+        win = tk.Toplevel(parent)
+        win.title(tr("service_cache_sounds"))
+        win.geometry("760x560")
+        win.transient(parent)
+        apply_icon(win)
+
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text=tr("cache_sounds_title"),
+                  font=("Arial", 13, "bold")).pack(anchor="w")
+        ttk.Label(body, text=tr("cache_sounds_explainer"),
+                  wraplength=720, justify="left",
+                  foreground="#cccccc").pack(anchor="w", pady=(4, 8))
+        ttk.Label(body, text=tr("cache_sounds_advice"),
+                  wraplength=720, justify="left",
+                  foreground="#9aa0a6").pack(anchor="w", pady=(0, 12))
+
+        # Текущее состояние кэша
+        status_frame = ttk.LabelFrame(body, text=tr("cache_sounds_status"))
+        status_frame.pack(fill="x", pady=4)
+        status_lbl = ttk.Label(status_frame, text="")
+        status_lbl.pack(anchor="w", padx=8, pady=6)
+
+        def refresh_status():
+            s = sounds_cache_status()
+            if s["cached"]:
+                mb = s["size"] / (1024 * 1024)
+                txt = tr("cache_sounds_status_cached").format(
+                    s["files"], f"{mb:.1f}", s.get("date") or "?")
+            else:
+                txt = tr("cache_sounds_status_empty")
+            status_lbl.config(text=txt)
+
+        # Лог операций
+        log_frame = ttk.LabelFrame(body, text=tr("finder_log"))
+        log_frame.pack(fill="both", expand=True, pady=8)
+        log_box = tk.Text(log_frame, height=10, wrap=tk.WORD)
+        log_box.pack(fill="both", expand=True, padx=4, pady=4)
+        log_box.config(state="disabled")
+
+        def log(line):
+            log_box.config(state="normal")
+            log_box.insert(tk.END, line + "\n")
+            log_box.config(state="disabled")
+            log_box.see(tk.END)
+            win.update_idletasks()
+            # дублируем в основной лог приложения
+            self.log(line)
+
+        # --- Действия ---
+        def cache_from_current():
+            inst = self.instance
+            if not inst:
+                error_box(win, tr("error"), tr("ts_no_active"))
+                return
+            res = cache_sounds_from_folder(inst["path"], log)
+            if res["ok"]:
+                info_box(win, tr("ok"),
+                         tr("cache_sounds_cached_ok").format(res["files"]))
+            else:
+                error_box(win, tr("error"),
+                          res.get("error") or tr("error"))
+            refresh_status()
+
+        def cache_from_folder():
+            d = filedialog.askdirectory(
+                parent=win, title=tr("cache_sounds_pick_source"))
+            if not d:
+                return
+            res = cache_sounds_from_folder(d, log)
+            if res["ok"]:
+                info_box(win, tr("ok"),
+                         tr("cache_sounds_cached_ok").format(res["files"]))
+            else:
+                error_box(win, tr("error"),
+                          res.get("error") or tr("error"))
+            refresh_status()
+
+        def apply_to_current():
+            inst = self.instance
+            if not inst:
+                error_box(win, tr("error"), tr("ts_no_active"))
+                return
+            res = apply_sounds_cache(inst["path"], log)
+            if res["ok"]:
+                info_box(win, tr("ok"),
+                         tr("cache_sounds_applied_ok").format(res["files"]))
+            else:
+                error_box(win, tr("error"),
+                          res.get("error") or tr("error"))
+
+        def clear_cache():
+            if not yesno(win, tr("service_cache_sounds"),
+                         tr("cache_sounds_clear_confirm")):
+                return
+            sounds_clear_cache()
+            log(tr("cache_sounds_cleared"))
+            refresh_status()
+
+        # --- Кнопки ---
+        row1 = ttk.LabelFrame(body, text=tr("cache_sounds_step1"))
+        row1.pack(fill="x", pady=4)
+        rb = ttk.Frame(row1)
+        rb.pack(anchor="w", padx=8, pady=6)
+        ttk.Button(rb, text=tr("cache_sounds_from_current"),
+                   command=cache_from_current).pack(side="left", padx=4)
+        ttk.Button(rb, text=tr("cache_sounds_from_folder"),
+                   command=cache_from_folder).pack(side="left", padx=4)
+        ttk.Button(rb, text=tr("cache_sounds_clear"),
+                   command=clear_cache).pack(side="left", padx=4)
+
+        row2 = ttk.LabelFrame(body, text=tr("cache_sounds_step2"))
+        row2.pack(fill="x", pady=4)
+        rb2 = ttk.Frame(row2)
+        rb2.pack(anchor="w", padx=8, pady=6)
+        ttk.Button(rb2, text=tr("cache_sounds_apply_current"),
+                   command=apply_to_current).pack(side="left", padx=4)
+
+        ttk.Button(body, text=tr("close"),
+                   command=win.destroy).pack(side="bottom", anchor="e",
+                                             pady=(8, 0))
+
+        refresh_status()
 
     # ---------- Version info ----------
     def show_version_dialog(self):
@@ -561,9 +1025,14 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         else:
             rw_state = tr("rw_state_unknown")
 
+        wf = detect_widescreen_fix(inst["path"])
+        wf_state = tr("widescreen_fix_present") if wf["present"] \
+            else tr("widescreen_fix_absent")
+
         text = tr("game_version_text").format(
             path=inst["path"], version=ver, dll=dll_state,
             dll_state=rw_state)
+        text += "\n" + tr("widescreen_fix_label") + ": " + wf_state
         info_box(self, tr("game_version_title"), text)
 
     # ---------- About modal ----------
@@ -601,10 +1070,146 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     # =====================================================
     # UI
     # =====================================================
+    ADD_LANG_SENTINEL = "+ Add language…"
+
+    def _lang_dropdown_values(self):
+        return list(LANGS.keys()) + [self.ADD_LANG_SENTINEL]
+
     def change_lang(self, *_):
-        set_lang(self.lang_var.get())
+        choice = self.lang_var.get()
+        if choice == self.ADD_LANG_SENTINEL:
+            # Откатываем выбор, чтобы пользователь не остался с виртуальным «языком»
+            prev = next((c for c in LANGS.keys() if c != self.ADD_LANG_SENTINEL),
+                        "en")
+            self.lang_var.set(prev)
+            self._open_add_language_dialog()
+            return
+        set_lang(choice)
         self.save_cfg()
         self.rebuild_ui()
+
+    def _open_add_language_dialog(self):
+        """Диалог добавления языка (ВСЕГДА на английском, чтобы был
+        универсальным независимо от текущего интерфейса)."""
+        win = tk.Toplevel(self)
+        win.title("Add language")
+        win.geometry("620x420")
+        win.transient(self)
+        win.resizable(False, False)
+        apply_icon(win)
+
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="Add a new language pack",
+                  font=("Arial", 14, "bold")).pack(anchor="w")
+        ttk.Label(
+            body,
+            text=("Drop a *.json file with translations next to your existing\n"
+                  "languages (data/languages/ is user-writable and works\n"
+                  "without admin rights), or generate an AI prompt and ask\n"
+                  "an LLM to translate the English pack for you."),
+            justify="left", foreground="gray").pack(anchor="w", pady=(4, 12))
+
+        # Кнопки 1 и 2
+        row1 = ttk.Frame(body)
+        row1.pack(fill="x", pady=4)
+
+        def pick_json():
+            p = filedialog.askopenfilename(
+                parent=win, title="Pick *.json", filetypes=[("JSON", "*.json")])
+            if not p:
+                return
+            try:
+                name = add_language_file(p)
+                if not name:
+                    error_box(win, "Error",
+                              "Translation file has no '_lang_name' key.")
+                    return
+                info_box(win, "OK", f"Language '{name}' added.")
+                self.rebuild_ui()
+                win.destroy()
+            except Exception as e:
+                error_box(win, "Error", f"Failed to add: {e}")
+
+        def open_lang_folder():
+            from mmi_lang import user_languages_dir
+            d = user_languages_dir()
+            try:
+                open_path(d)
+            except Exception as e:
+                error_box(win, "Error", str(e))
+
+        ttk.Button(row1, text="Pick *.json", command=pick_json,
+                   width=22).pack(side="left", padx=4)
+        ttk.Button(row1, text="Open languages folder",
+                   command=open_lang_folder, width=22).pack(side="left", padx=4)
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
+
+        # AI-промпт
+        ttk.Label(body, text="Generate AI prompt").pack(anchor="w")
+        ttk.Label(body,
+                  text=("Type the target language name (e.g. 'Spanish',\n"
+                        "'日本語', 'Polski'). Clicking the button copies a\n"
+                        "prompt with full en.json contents to clipboard."),
+                  justify="left", foreground="gray").pack(anchor="w", pady=(2, 6))
+
+        row2 = ttk.Frame(body)
+        row2.pack(fill="x")
+        lang_name_var = tk.StringVar()
+        ttk.Label(row2, text="Enter Language:").pack(side="left", padx=(0, 6))
+        ttk.Entry(row2, textvariable=lang_name_var,
+                  width=24).pack(side="left")
+
+        def gen_prompt():
+            lang_name = lang_name_var.get().strip()
+            if not lang_name:
+                error_box(win, "Error", "Type a language name first.")
+                return
+            try:
+                en_path = os.path.join(
+                    res_path("languages"), "en.json")
+                if not os.path.isfile(en_path):
+                    # fallback: user-writable dir
+                    en_path = os.path.join(
+                        os.path.join(DATA, "languages"), "en.json")
+                with open(en_path, "r", encoding="utf-8") as f:
+                    en_text = f.read()
+            except Exception as e:
+                error_box(win, "Error", f"Cannot read en.json: {e}")
+                return
+            prompt = (
+                "You are a localization translator. Produce a complete "
+                f"Mafia Mod Installer language pack in {lang_name}.\n\n"
+                "Rules:\n"
+                "  1. Output a SINGLE valid JSON object (no commentary, no "
+                "markdown fences).\n"
+                "  2. Keep every key from the English source EXACTLY as is.\n"
+                "  3. Set the value of \"_lang_name\" to the language's "
+                f"endonym (its name in {lang_name}, e.g. 'Deutsch' for German).\n"
+                "  4. Preserve placeholders like {} and {name}.\n"
+                "  5. Use natural, idiomatic phrasing.\n"
+                "  6. Save the result as <code>.json (e.g. 'es.json' for "
+                "Spanish) and place it in data/languages/ next to the "
+                "MafiaModInstaller.exe.\n\n"
+                "Below is the full English source:\n\n"
+                + en_text
+            )
+            self.clipboard_clear()
+            self.clipboard_append(prompt)
+            self.update()
+            info_box(win, "OK",
+                     "Prompt copied to clipboard. Paste it into "
+                     "ChatGPT/Claude and save the result as data/languages/"
+                     "<code>.json.")
+
+        ttk.Button(row2, text="Generate prompt and copy to clipboard",
+                   command=gen_prompt).pack(side="left", padx=8)
+
+        ttk.Button(body, text="Close",
+                   command=win.destroy).pack(side="bottom", anchor="e",
+                                             pady=(16, 0))
 
     def rebuild_ui(self):
         for w in self.winfo_children():
@@ -639,7 +1244,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         ttk.Label(top, text="Language:").pack(side="right", padx=5)
         self.lang_combo = ttk.Combobox(
             top, textvariable=self.lang_var,
-            values=list(LANGS.keys()), state="readonly", width=8)
+            values=self._lang_dropdown_values(), state="readonly", width=20)
         self.lang_combo.pack(side="right")
         self.lang_combo.bind("<<ComboboxSelected>>", self.change_lang)
 
@@ -745,13 +1350,19 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         ttk.Button(bottom, text=tr("clear_log"),
                    command=self.clear_log).grid(row=0, column=0, sticky="w", padx=4)
+        self.auto_dta_var = tk.BooleanVar(
+            value=bool(self.settings.get("auto_extract_dta", True)))
+        self.auto_dta_var.trace_add("write", self._on_auto_dta_toggled)
+        cb = ttk.Checkbutton(bottom, text=tr("auto_extract_dta"),
+                             variable=self.auto_dta_var)
+        cb.grid(row=0, column=1, sticky="e", padx=4)
         b1 = ttk.Button(bottom, text=tr("install_to_game"),
                         command=lambda: self.install_to_game(False))
-        b1.grid(row=0, column=1, sticky="e", padx=4)
+        b1.grid(row=0, column=2, sticky="e", padx=4)
         b1.bind("<Button-3>", self._run_context_menu)
         b2 = ttk.Button(bottom, text=tr("install_and_run"),
                         command=lambda: self.install_to_game(True))
-        b2.grid(row=0, column=2, sticky="e", padx=4)
+        b2.grid(row=0, column=3, sticky="e", padx=4)
         b2.bind("<Button-3>", self._run_context_menu)
 
     def _on_game_selected(self, *_):
@@ -945,13 +1556,14 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                   wraplength=900,
                   foreground="gray").grid(row=1, column=0, sticky="w", pady=(0, 8))
 
-        cols = ("date", "type", "label")
+        cols = ("date", "type", "label", "mods")
         self.saves_table = ttk.Treeview(f, columns=cols, show="headings",
                                         height=12, selectmode="extended")
         for col_id, col_text, col_w in [
-            ("date", tr("saves_col_date"), 200),
-            ("type", tr("saves_col_type"), 100),
-            ("label", tr("saves_col_label"), 360),
+            ("date", tr("saves_col_date"), 180),
+            ("type", tr("saves_col_type"), 90),
+            ("label", tr("saves_col_label"), 280),
+            ("mods", tr("saves_col_mods"), 240),
         ]:
             self.saves_table.heading(col_id, text=col_text)
             self.saves_table.column(col_id, width=col_w)
@@ -999,6 +1611,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         menu.add_command(label=tr("rename_mod"), command=self.rename_selected_mod)
         menu.add_command(label=tr("priority_change"),
                          command=self.change_selected_priority)
+        menu.add_command(label=tr("edit_target_version"),
+                         command=self.change_selected_target_version)
         menu.add_command(label=tr("open_mod_folder"), command=self.open_mod_folder)
         menu.add_command(label=tr("open_readme"), command=self.open_readme_file)
         menu.add_command(label=tr("open_mmi_readme"),
@@ -1050,7 +1664,10 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         try:
             ids, mmi_readme = add_mod_to_library(
                 path, name=name, priority=priority,
-                target_version=target_version)
+                target_version=target_version,
+                autodetect_target_version=bool(
+                    self.settings.get(
+                        "experimental_autodetect_target_version", False)))
             self.log(tr("upload_done") + f" ({len(ids)})")
             if mmi_readme:
                 self._show_mmi_readme_popup(mmi_readme)
@@ -1202,6 +1819,21 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         except Exception as e:
             self.log(tr("logo_failed").format(e))
 
+    def _on_auto_dta_toggled(self, *_):
+        new_val = bool(self.auto_dta_var.get())
+        if not new_val:
+            # Двойное предупреждение перед отключением
+            if not yesno(self, tr("auto_extract_dta"),
+                         tr("auto_extract_dta_off_confirm1")):
+                self.auto_dta_var.set(True)
+                return
+            if not yesno(self, tr("auto_extract_dta"),
+                         tr("auto_extract_dta_off_confirm2")):
+                self.auto_dta_var.set(True)
+                return
+        self.settings["auto_extract_dta"] = new_val
+        self.save_cfg()
+
     def install_to_game(self, run_after):
         inst = self.instance
         if not inst:
@@ -1209,6 +1841,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         if not inst.get("has_clean_backup"):
             self._ensure_clean_backup(prompt=True)
         if not inst.get("has_clean_backup"):
+            info_box(self, tr("info"), tr("install_blocked_no_clean"))
             return
 
         ids = [mid for mid, var in self.mm_vars.items() if var.get()]
@@ -1255,12 +1888,29 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         else:
             self.log(tr("auto_backup_off_log"))
 
+        if self.settings.get("auto_extract_dta", True):
+            try:
+                mod_dirs = [m.get("dir") for m in selected if m.get("dir")]
+                needed = compute_dtas_for_dirs(mod_dirs)
+                if needed:
+                    if not dta_cli_available():
+                        self.log(tr("auto_extract_dta_no_cli"))
+                    else:
+                        self.log(tr("auto_extract_dta_start").format(
+                            ", ".join(needed)))
+                        extract_dtas(inst["path"], needed, self.log)
+            except Exception as e:
+                self.log(tr("auto_extract_dta_failed").format(e))
+
         try:
             install_mods_into_game(selected, inst, self.settings, self.log)
             self.log(tr("install_to_game_complete"))
             self.instances = load_json(PATHS["instances_json"], [])
             self.refresh_mods_list()
             self.refresh_saves_list()
+            # После установки повторяем auto-detect widescreen (мод мог
+            # положить dinput8.dll / scripts/Mafia.WidescreenFix.asi).
+            self._auto_widescreen_detect()
             # Логотип формируется СРАЗУ после установки — иначе при первом
             # запуске игры пользователь увидит ванильный logo1.avi.
             self._maybe_update_logo()
@@ -1342,10 +1992,15 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         for s in reversed(inst.get("saves", [])):
             type_ = s.get("type", "manual")
             type_str = tr(f"saves_type_{type_}")
+            mods_meta = s.get("active_mods") or []
+            mods_str = ", ".join(
+                (m.get("name") or m.get("id") or "?") for m in mods_meta
+            ) if mods_meta else ""
             self.saves_table.insert("", "end", iid=s["id"],
                                     values=(s.get("date", ""),
                                             type_str,
-                                            s.get("label", "")))
+                                            s.get("label", ""),
+                                            mods_str))
 
     def get_selected_mod(self):
         """Возвращает первый выделенный мод (для одиночных операций)."""
@@ -1384,6 +2039,41 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             return
         update_mod_field(mod["id"], "priority", int(new))
         self.refresh_all()
+
+    def change_selected_target_version(self):
+        mod = self.get_selected_mod()
+        if not mod:
+            return
+        win = tk.Toplevel(self)
+        apply_icon(win)
+        win.title(tr("edit_target_version_title").format(
+            mod.get("name") or mod["id"]))
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text=tr("edit_target_version_prompt"),
+                  wraplength=320).pack(padx=12, pady=(12, 6))
+        current = (mod.get("target_version") or "").strip()
+        var = tk.StringVar(value=current if current in GAME_VERSIONS else "")
+        choices = [tr("any_version")] + list(GAME_VERSIONS)
+        display_var = tk.StringVar(
+            value=current if current in GAME_VERSIONS else tr("any_version"))
+        ttk.Combobox(win, textvariable=display_var, values=choices,
+                     state="readonly", width=20).pack(padx=12, pady=4)
+
+        def on_ok():
+            v = display_var.get()
+            new = v if v in GAME_VERSIONS else ""
+            update_mod_field(mod["id"], "target_version", new)
+            win.destroy()
+            self.refresh_all()
+
+        bf = ttk.Frame(win)
+        bf.pack(pady=10)
+        ttk.Button(bf, text=tr("ok"), command=on_ok).pack(side="left", padx=4)
+        ttk.Button(bf, text=tr("cancel"),
+                   command=win.destroy).pack(side="left", padx=4)
+        win.grab_set()
+        win.wait_window()
 
     def remove_selected_mod(self):
         mods = self.get_selected_mods()

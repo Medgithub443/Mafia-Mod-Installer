@@ -41,7 +41,7 @@ ICON_PATH = res_path(os.path.join("assets", "mmi.ico"))
 
 # Глобальные настройки приложения
 APP_NAME = "Mafia Mod Installer"
-APP_VERSION = "0.14"
+APP_VERSION = "0.16"
 
 DEFAULT_PRIORITY = 2
 MMI_README_LIMIT = 2000
@@ -57,6 +57,10 @@ DEFAULT_SETTINGS = {
     "conflict_check": False,
     "immutable_saves": True,
     "auto_backup_saves": True,           # авто-бэкап savegame/ перед install
+    "auto_extract_dta": False,           # ВЫКЛ по умолчанию с v0.16
+    "experimental_autodetect_target_version": False,  # экспериментально
+    "use_alt_logo": False,               # logo1_alt.avi без оверлея
+    "auto_widescreen_detect": True,      # автоопределение WidescreenFix
     "recommended_count_on": True,
     "recommended_count": DEFAULT_RECOMMENDED_COUNT,
 }

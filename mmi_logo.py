@@ -23,9 +23,9 @@ def _logo_text(selected_mods) -> str:
     return "\n".join(line for line in lines if line.strip())
 
 
-def _logo_cache_key(selected_mods, widescreen: bool) -> str:
+def _logo_cache_key(selected_mods, widescreen: bool, alt: bool) -> str:
     payload = "|".join(sorted(m["id"] for m in selected_mods))
-    payload += f"|ws={int(bool(widescreen))}"
+    payload += f"|ws={int(bool(widescreen))}|alt={int(bool(alt))}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
 
 
@@ -45,13 +45,28 @@ def _find_logomaker() -> str:
 
 def update_logo_in_game(selected_mods, game_path, settings, logger) -> None:
     widescreen = bool(settings.get("widescreen", False))
-    cache_key = _logo_cache_key(selected_mods, widescreen)
+    use_alt = bool(settings.get("use_alt_logo", False))
+    cache_key = _logo_cache_key(selected_mods, widescreen, use_alt)
     cached = os.path.join(PATHS["logos_dir"], f"{cache_key}.avi")
-    template = res_path(os.path.join("assets", "logo1.avi"))
+
+    # При use_alt берём logo1_alt.avi и НЕ накладываем текст со списком модов.
+    template_name = "logo1_alt.avi" if use_alt else "logo1.avi"
+    template = res_path(os.path.join("assets", template_name))
+    if use_alt and not os.path.exists(template):
+        # Если alt-шаблон не положен в assets/, fallback на logo1.avi
+        # и обычный pipeline.
+        logger("logo1_alt.avi не найден — fallback на logo1.avi с оверлеем")
+        use_alt = False
+        template = res_path(os.path.join("assets", "logo1.avi"))
     font = res_path(os.path.join("assets", "aurorabdcnbtrusbyme_bold.otf"))
 
     if not os.path.exists(template):
         raise FileNotFoundError(template)
+
+    if use_alt:
+        # Просто копируем шаблон без оверлея — без вызова logoMaker.
+        shutil.copy2(template, os.path.join(game_path, "logo1.avi"))
+        return
 
     if not os.path.exists(cached):
         exe = _find_logomaker()

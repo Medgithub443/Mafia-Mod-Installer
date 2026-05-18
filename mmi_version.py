@@ -80,6 +80,69 @@ def _sha256(path: str) -> str:
 
 
 # ---------------------------------------------------------
+# Mafia.WidescreenFix — auto-detect
+# ---------------------------------------------------------
+
+def detect_widescreen_fix(game_path: str) -> dict:
+    """Возвращает {'present': bool, 'dinput8': bool, 'asi': bool, 'ini': bool}.
+
+    Mafia.WidescreenFix кладёт:
+      • dinput8.dll в корень игры
+      • scripts/Mafia.WidescreenFix.asi
+      • scripts/Mafia.WidescreenFix.ini
+    Достаточно одновременно (a) и (b). dinput8.dll проверяем грубо
+    по размеру (>500 KB) чтобы не путать с другими обёртками.
+    """
+    out = {"present": False, "dinput8": False, "asi": False, "ini": False}
+    if not game_path or not os.path.isdir(game_path):
+        return out
+    di8 = os.path.join(game_path, "dinput8.dll")
+    asi = os.path.join(game_path, "scripts", "Mafia.WidescreenFix.asi")
+    ini = os.path.join(game_path, "scripts", "Mafia.WidescreenFix.ini")
+    if os.path.isfile(di8):
+        try:
+            if os.path.getsize(di8) > 500 * 1024:
+                out["dinput8"] = True
+        except OSError:
+            pass
+    if os.path.isfile(asi):
+        out["asi"] = True
+    if os.path.isfile(ini):
+        out["ini"] = True
+    out["present"] = out["dinput8"] and out["asi"]
+    return out
+
+
+# ---------------------------------------------------------
+# Mafia game folder validation (used by Instance Finder)
+# ---------------------------------------------------------
+
+def is_mafia_game_folder(folder: str) -> dict | None:
+    """Если в `folder` лежит Game.exe И валидная LS3DF.dll с детектируемой
+    версией — возвращает {'path', 'version', 'build', 'name'}. Иначе None."""
+    if not folder or not os.path.isdir(folder):
+        return None
+    game_exe = os.path.join(folder, "Game.exe")
+    if not os.path.isfile(game_exe):
+        # case-insensitive
+        try:
+            names = {n.lower() for n in os.listdir(folder)}
+        except OSError:
+            return None
+        if "game.exe" not in names:
+            return None
+    info = detect_game_version(folder)
+    if not info.get("version"):
+        return None
+    return {
+        "path": folder,
+        "version": info["version"],
+        "build": info["build"],
+        "name": os.path.basename(folder.rstrip("/\\")),
+    }
+
+
+# ---------------------------------------------------------
 # Парсинг целевой версии мода из README
 # ---------------------------------------------------------
 

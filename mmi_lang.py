@@ -1,23 +1,34 @@
 """Переводы (ru/en/cz и любые добавленные json в languages/).
 
-Языковые пакеты ищем в двух местах:
-  1. <app_dir>/languages/   — рядом с MafiaModInstaller.exe.
-     Сюда пользователь может класть свои .json без пересборки.
-  2. <bundle>/languages/    — bundled внутрь exe (PyInstaller _MEIPASS).
+Языковые пакеты ищем в ТРЁХ местах (в порядке применения):
+  1. <bundle>/languages/    — bundled внутрь exe (PyInstaller _MEIPASS).
+  2. <app_dir>/languages/   — рядом с MafiaModInstaller.exe.
+  3. <data>/languages/      — user-writable, всегда доступная для записи
+     (Program Files может требовать админа, а data/ создаётся под пользователя).
 
-Файлы из app_dir перекрывают bundled (приоритет у пользователя)."""
+Файлы из (2) перекрывают (1), а из (3) — обоих. Пакеты, добавленные
+через диалог «Добавить язык…», копируются именно в (3) — это исключает
+проблему read-only Program Files и в проверенный путь."""
 
 import json
 import locale
 import os
+import shutil
 
-from mmi_paths import res_path, app_dir
+from mmi_paths import res_path, app_dir, DATA
 
 LANG = "en"
 # ВАЖНО: эти dict-ы заменять нельзя — main.py делает `from mmi_lang import LANGS`
 # и держит ссылку на этот объект. Иначе обновления не увидит.
 LANGS: dict = {}
 LANG_NAMES: dict = {}
+
+
+def user_languages_dir() -> str:
+    """Папка для пользовательских .json (user-writable)."""
+    p = os.path.join(DATA, "languages")
+    os.makedirs(p, exist_ok=True)
+    return p
 
 
 def _scan_dir(lang_dir: str) -> None:
@@ -39,10 +50,32 @@ def _scan_dir(lang_dir: str) -> None:
 def load_languages() -> None:
     LANGS.clear()
     LANG_NAMES.clear()
-    # Сначала bundled (из PyInstaller _MEIPASS) — будет дефолтом.
+    # 1) bundled
     _scan_dir(res_path("languages"))
-    # Потом — папка рядом с .exe; перекрывает bundled теми же кодами.
+    # 2) рядом с .exe (для совместимости с предыдущими версиями)
     _scan_dir(os.path.join(app_dir(), "languages"))
+    # 3) user-writable (data/languages/)
+    _scan_dir(user_languages_dir())
+
+
+def add_language_file(src_json_path: str) -> str:
+    """Копирует пользовательский .json в data/languages/ и подгружает.
+
+    Возвращает имя языка из ключа `_lang_name` (или '' если пакет некорректный).
+    """
+    try:
+        with open(src_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        raise ValueError(f"Невалидный JSON: {e}")
+    name = (data.get("_lang_name") or "").strip()
+    if not name:
+        return ""
+    dst_dir = user_languages_dir()
+    dst = os.path.join(dst_dir, os.path.basename(src_json_path))
+    shutil.copyfile(src_json_path, dst)
+    load_languages()
+    return name
 
 
 def detect_lang() -> str:

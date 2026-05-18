@@ -99,7 +99,8 @@ def _new_mod_id(display_name: str) -> str:
 
 def add_mod_to_library(source_path: str, name: str = None,
                        priority: int = DEFAULT_PRIORITY,
-                       target_version: str = None) -> tuple:
+                       target_version: str = None,
+                       autodetect_target_version: bool = False) -> tuple:
     """Загружает мод из архива/папки в библиотеку.
 
     Поведение:
@@ -144,7 +145,8 @@ def add_mod_to_library(source_path: str, name: str = None,
                             sub_ids, _ = _ingest_source(
                                 tmp_zip, display, priority=mp,
                                 mmi_readme=mmi_readme,
-                                target_version=tv)
+                                target_version=tv,
+                                autodetect_target_version=autodetect_target_version)
                             added.extend(sub_ids)
                     return added, mmi_readme
         except zipfile.BadZipFile:
@@ -154,14 +156,16 @@ def add_mod_to_library(source_path: str, name: str = None,
     base_priority = priority
     ids, _ = _ingest_source(source_path, name or base_label,
                             priority=base_priority, mmi_readme="",
-                            target_version=target_version)
+                            target_version=target_version,
+                            autodetect_target_version=autodetect_target_version)
     return ids, ""
 
 
 def _ingest_source(source_path: str, display_name: str,
                    priority: int = DEFAULT_PRIORITY,
                    mmi_readme: str = "",
-                   target_version: str = None) -> tuple:
+                   target_version: str = None,
+                   autodetect_target_version: bool = False) -> tuple:
     """Распаковывает архив или копирует папку во временную директорию,
     ищет ВСЕ корни мода и для каждого создаёт отдельную запись в библиотеке.
 
@@ -169,18 +173,21 @@ def _ingest_source(source_path: str, display_name: str,
     """
     if os.path.isdir(source_path):
         return _ingest_from_unpacked(source_path, display_name, priority,
-                                     mmi_readme, target_version)
+                                     mmi_readme, target_version,
+                                     autodetect_target_version)
 
     with tempfile.TemporaryDirectory() as tmp:
         if not extract_archive(source_path, tmp):
             raise RuntimeError("Не удалось распаковать архив")
         return _ingest_from_unpacked(tmp, display_name, priority,
-                                     mmi_readme, target_version)
+                                     mmi_readme, target_version,
+                                     autodetect_target_version)
 
 
 def _ingest_from_unpacked(unpacked_path: str, display_name: str,
                           priority: int, mmi_readme: str,
-                          target_version: str = None) -> tuple:
+                          target_version: str = None,
+                          autodetect_target_version: bool = False) -> tuple:
     roots = detect_root_folders(unpacked_path)
     if not roots:
         # нет ни одного game-like корня — копируем всю переданную папку,
@@ -199,8 +206,9 @@ def _ingest_from_unpacked(unpacked_path: str, display_name: str,
             mod_name = display_name
 
         # Определяем target_version: явный аргумент → readme в этом корне
+        # (если включена экспериментальная автодетекция).
         tv = target_version
-        if not tv:
+        if not tv and autodetect_target_version:
             readmes = find_readmes(root)
             tv = guess_target_version_from_readmes(readmes)
 
