@@ -247,3 +247,22 @@ def find_readmes(mod_dir: str):
                 out.append(full)
                 seen.add(full)
     return out
+
+
+# ---------------------------------------------------------
+# Человекочитаемые имена модов
+# ---------------------------------------------------------
+
+_ARCHIVE_EXT_RE = re.compile(
+    r"\.(zip|rar|7z|mmi|tar|gz|bz2|xz)$", re.IGNORECASE)
+
+
+def pretty_mod_name(filename: str) -> str:
+    """Авто-имя мода из имени файла: fugitive_mission_mod.zip →
+    «Fugitive Mission Mod». Токены (разделители _ - пробел) пишутся с
+    большой буквы, цифры остаются отдельными токенами («… Mod 2 0»).
+    Работает и для кириллицы."""
+    base = _ARCHIVE_EXT_RE.sub("", filename or "")
+    tokens = [t for t in re.split(r"[_\-\s]+", base) if t]
+    pretty = " ".join(t.capitalize() for t in tokens).strip()
+    return pretty or base.strip() or (filename or "").strip()

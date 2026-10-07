@@ -56,6 +56,15 @@ def make_saves_backup(instance: dict, type_: str = "manual",
     if not os.path.isdir(src):
         return ""
     sid = now_compact() + ("_auto" if type_ == "auto" else "_manual")
+    # Уникальность id: два бэкапа в одну секунду не должны давать дубликат
+    # (дерево сохранений в GUI падает на повторном iid).
+    existing = {s.get("id") for s in instance.get("saves", [])}
+    if sid in existing:
+        base = sid
+        n = 2
+        while sid in existing:
+            sid = f"{base}_{n}"
+            n += 1
     dst_root = os.path.join(inst_paths["saves_history"], sid)
     if os.path.isdir(dst_root):
         shutil.rmtree(dst_root, ignore_errors=True)

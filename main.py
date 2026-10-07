@@ -1,5 +1,5 @@
 # =========================================================
-# Mafia Mod Installer v0.14
+# Mafia Mod Installer v0.17.4
 # main.py — точка входа и GUI
 #
 # Бизнес-логика разнесена по модулям:
@@ -14,12 +14,14 @@
 #   mmi_service.py     — revert all/one, find duplicates, troubleshooter
 #   mmi_version.py     — детекция версии игры (LS3DF.dll)
 #   mmi_gui.py         — иконки и обёртки messagebox
+#   mmi_patches.py     — патчи для игры (скачивание в data/patches/, установка)
 # =========================================================
 
 import datetime
 import os
 import subprocess
 import sys
+import threading
 import webbrowser
 import zipfile
 import shutil
@@ -37,11 +39,13 @@ except ImportError:
 from mmi_paths import (PATHS, DATA, APP_NAME, APP_VERSION,
                        DEFAULT_SETTINGS, DEFAULT_PRIORITY,
                        DEFAULT_RECOMMENDED_COUNT, MMI_README_LIMIT,
-                       GAME_VERSIONS, res_path)
+                       GAME_VERSIONS, DEFAULT_TRACKERS, GAME_WONT_START_URL,
+                       res_path)
 from mmi_lang import (LANGS, load_languages, detect_lang, set_lang, tr,
                        add_language_file)
 from mmi_utils import (load_json, save_json, slugify, open_path,
-                       detect_steam_path, find_readmes, append_log, now)
+                       detect_steam_path, find_readmes, append_log, now,
+                       pretty_mod_name)
 from mmi_mods import (add_mod_to_library, remove_mod_from_library,
                       update_mod_field, build_mmi, mod_has_saves)
 from mmi_instances import (get_instance_paths, find_instance,
@@ -61,14 +65,27 @@ from mmi_version import (detect_game_version, is_rw_data_patched,
                           detect_widescreen_fix, is_mafia_game_folder)
 from mmi_dta import (compute_dtas_for_dirs, extract_dtas,
                      is_available as dta_cli_available)
-from mmi_cache import (cache_sounds_from_folder, apply_sounds_cache,
-                       cache_status as sounds_cache_status,
-                       clear_cache as sounds_clear_cache)
 from mmi_finder import scan as scan_for_games
+from mmi_patches import (PATCHES, cached_patch_file,
+                         download_patch, install_patch_file,
+                         record_patch_install)
 from mmi_gui import apply_icon, info_box, error_box, yesno, yesnocancel
 
 
 # =========================================================
+# Тёмная тема (настройка «Тёмная тема» в Настройках)
+# =========================================================
+DARK_COLORS = {
+    "bg": "#23262b",      # фон окон и фреймов
+    "bg2": "#2d3138",     # кнопки, панели, неактивные вкладки
+    "fg": "#e4e7eb",      # основной текст
+    "field": "#17191d",   # поля ввода, логи, списки
+    "sel": "#3f6fbf",     # выделение / наведение
+    "border": "#3a3f47",  # разделители и рамки
+    "disabled": "#7a8089",
+}
+
+
 class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
     def __init__(self):
@@ -89,6 +106,13 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         self.lang_var = tk.StringVar(value=lang)
         self.settings = dict(DEFAULT_SETTINGS)
         self.settings.update(self.cfg.get("settings", {}))
+        # Строка статуса нового интерфейса «Установка» (последнее событие).
+        self.status_var = tk.StringVar(value="")
+
+        # Тема: запоминаем системную тему ttk ДО возможного переключения
+        # на clam и применяем выбранную (светлая/тёмная) до построения UI.
+        self._base_theme = ttk.Style(self).theme_use()
+        self._apply_theme()
 
         self.upload_path = tk.StringVar()
         self.upload_name = tk.StringVar()
@@ -113,6 +137,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         self._auto_widescreen_detect()
         self.create_menu()
         self.create_ui()
+        self._bind_layout_safe_clipboard()
 
         if DND_AVAILABLE:
             try:
@@ -154,6 +179,224 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         self.cfg["settings"] = self.settings
         self.cfg["current_instance"] = self.current_instance_id
         save_json(PATHS["config"], self.cfg)
+
+    @staticmethod
+    def _center_window(win, w: int, h: int):
+        """Позиционирует Toplevel в центре экрана."""
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+    # ---------- Тёмная тема ----------
+    def _theme_dark(self) -> bool:
+        return bool(self.settings.get("dark_theme", False))
+
+    def _apply_theme(self):
+        """Применяет светлую/тёмную тему к ttk-стилям.
+
+        Классические tk-виджеты (Text, Listbox, Canvas, Menu) не слушают
+        ttk-стили — их цвета задаются при создании через _tk_*_opts(),
+        поэтому после смены темы интерфейс пересобирается (rebuild_ui).
+        """
+        style = ttk.Style(self)
+        if not self._theme_dark():
+            style.theme_use(self._base_theme)
+            # Откатываем option_add из тёмной темы (popdown Combobox).
+            self.option_add("*TCombobox*Listbox.background",
+                            "SystemWindow")
+            self.option_add("*TCombobox*Listbox.foreground",
+                            "SystemWindowText")
+            self.option_add("*TCombobox*Listbox.selectBackground",
+                            "SystemHighlight")
+            self.option_add("*TCombobox*Listbox.selectForeground",
+                            "SystemHighlightText")
+            return
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        c = DARK_COLORS
+        style.configure(".", background=c["bg"], foreground=c["fg"],
+                        troughcolor=c["bg2"], bordercolor=c["border"],
+                        darkcolor=c["bg2"], lightcolor=c["bg2"])
+        style.configure("TButton", background=c["bg2"], foreground=c["fg"],
+                        padding=6)
+        style.map("TButton",
+                  background=[("pressed", c["sel"]),
+                              ("active", c["border"])],
+                  foreground=[("disabled", c["disabled"])])
+        style.configure("TLabel", padding=3)
+        style.configure("TCheckbutton", background=c["bg"],
+                        foreground=c["fg"])
+        style.configure("TRadiobutton", background=c["bg"],
+                        foreground=c["fg"])
+        style.map("TCheckbutton", background=[("active", c["bg"])])
+        style.map("TRadiobutton", background=[("active", c["bg"])])
+        style.configure("TEntry", fieldbackground=c["field"],
+                        foreground=c["fg"])
+        style.configure("TCombobox", fieldbackground=c["field"],
+                        foreground=c["fg"], arrowcolor=c["fg"])
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", c["field"])])
+        style.configure("TSpinbox", fieldbackground=c["field"],
+                        foreground=c["fg"], arrowcolor=c["fg"])
+        style.configure("TLabelframe", background=c["bg"])
+        style.configure("TLabelframe.Label", background=c["bg"],
+                        foreground=c["fg"])
+        style.configure("TNotebook", background=c["bg2"],
+                        bordercolor=c["border"])
+        style.configure("TNotebook.Tab", background=c["bg2"],
+                        foreground=c["fg"], padding=(10, 4))
+        style.map("TNotebook.Tab",
+                  background=[("selected", c["bg"])],
+                  foreground=[("selected", c["fg"])])
+        style.configure("TPanedwindow", background=c["bg"])
+        style.configure("TSeparator", background=c["border"])
+        style.configure("TScrollbar", background=c["bg2"],
+                        troughcolor=c["bg"], arrowcolor=c["fg"],
+                        bordercolor=c["bg"])
+        style.configure("Treeview", background=c["field"],
+                        fieldbackground=c["field"], foreground=c["fg"],
+                        bordercolor=c["border"])
+        style.map("Treeview",
+                  background=[("selected", c["sel"])],
+                  foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=c["bg2"],
+                        foreground=c["fg"])
+        style.map("Treeview.Heading",
+                  background=[("active", c["border"])])
+        style.configure("TMenubutton", background=c["bg2"],
+                        foreground=c["fg"])
+        # Стиль диалога настроек (там свои Set.*-стили со шрифтами).
+        style.configure("Set.TCheckbutton", background=c["bg"],
+                        foreground=c["fg"])
+        style.configure("Set.TLabelframe", background=c["bg"])
+        style.configure("Set.TLabelframe.Label", background=c["bg"],
+                        foreground=c["fg"])
+        style.configure("Set.TLabel", background=c["bg"],
+                        foreground=c["fg"])
+        # Выпадающий список Combobox — отдельный tk-листбокс.
+        self.option_add("*TCombobox*Listbox.background", c["field"])
+        self.option_add("*TCombobox*Listbox.foreground", c["fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["sel"])
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+
+    def _tk_text_opts(self) -> dict:
+        """Цвета для классического tk.Text согласно текущей теме."""
+        if not self._theme_dark():
+            return {}
+        c = DARK_COLORS
+        return {"background": c["field"], "foreground": c["fg"],
+                "insertbackground": c["fg"], "selectbackground": c["sel"]}
+
+    def _tk_listbox_opts(self) -> dict:
+        if not self._theme_dark():
+            return {}
+        c = DARK_COLORS
+        return {"background": c["field"], "foreground": c["fg"],
+                "selectbackground": c["sel"]}
+
+    def _tk_canvas_opts(self) -> dict:
+        if not self._theme_dark():
+            return {}
+        return {"background": DARK_COLORS["bg"]}
+
+    def _menu_opts(self) -> dict:
+        """Цвета для tk.Menu (menubar и контекстные меню)."""
+        if not self._theme_dark():
+            return {}
+        c = DARK_COLORS
+        return {"background": c["bg2"], "foreground": c["fg"],
+                "activebackground": c["sel"],
+                "activeforeground": "#ffffff",
+                "disabledforeground": c["disabled"]}
+
+    # ---------- Буфер обмена независимо от раскладки ----------
+    def _bind_layout_safe_clipboard(self):
+        """Ctrl+C / Ctrl+X / Ctrl+V должны работать в любой раскладке.
+
+        Стандартные биндинги Tk срабатывают только для латинских keysym
+        (Control-Key-c), поэтому на русской/чешской раскладке копирование
+        не работало. Перехватываем Control-KeyPress глобально и смотрим
+        keycode — Windows virtual-key code, он НЕ зависит от раскладки.
+        Для латиницы ранее уже отработали класс-биндинги — пропускаем."""
+        self.bind_all("<Control-KeyPress>", self._on_ctrl_keypress)
+
+    def _on_ctrl_keypress(self, event):
+        keysym = (event.keysym or "").lower()
+        if keysym in ("c", "v", "x"):
+            return  # латиница — стандартные биндинги уже обработали
+        vk = getattr(event, "keycode", 0) or 0
+        seq = {67: "<<Copy>>", 88: "<<Cut>>", 86: "<<Paste>>"}.get(vk)
+        if not seq:
+            return
+        w = self.focus_get()
+        if w is None:
+            return
+        try:
+            w.event_generate(seq)
+        except Exception:
+            pass
+
+    # ---------- Trackers ----------
+    def _get_trackers(self) -> list:
+        """Трекеры модов: пользовательские из config.json, иначе стандартные."""
+        trackers = self.cfg.get("trackers")
+        if isinstance(trackers, list) and trackers:
+            return trackers
+        return list(DEFAULT_TRACKERS)
+
+    def _fill_trackers_menu(self, menu: tk.Menu):
+        for t in self._get_trackers():
+            name = str(t.get("name") or t.get("url") or "?")
+            url = str(t.get("url") or "")
+            menu.add_command(
+                label=f"{name} - {url}",
+                command=lambda u=url: webbrowser.open(u))
+        menu.add_separator()
+        menu.add_command(label=tr("trackers_add"),
+                         command=self._open_add_tracker_dialog)
+
+    def _open_add_tracker_dialog(self):
+        win = tk.Toplevel(self)
+        win.title(tr("trackers_add_title"))
+        self._center_window(win, 460, 210)
+        win.transient(self)
+        win.resizable(False, False)
+        apply_icon(win)
+
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=tr("trackers_name_label")).pack(anchor="w")
+        name_var = tk.StringVar()
+        ttk.Entry(body, textvariable=name_var).pack(fill="x", pady=(2, 10))
+        ttk.Label(body, text=tr("trackers_url_label")).pack(anchor="w")
+        url_var = tk.StringVar()
+        ttk.Entry(body, textvariable=url_var).pack(fill="x", pady=(2, 10))
+
+        def do_add():
+            name = name_var.get().strip()
+            url = url_var.get().strip()
+            if not name or not url or "." not in url:
+                error_box(win, tr("error"), tr("trackers_invalid"))
+                return
+            trackers = self._get_trackers()
+            trackers.append({"name": name, "url": url})
+            self.cfg["trackers"] = trackers
+            self.save_cfg()
+            win.destroy()
+            self.create_menu()
+            info_box(self, tr("ok"), tr("trackers_added").format(name))
+
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(6, 0))
+        ttk.Button(bar, text=tr("settings_save"),
+                   command=do_add).pack(side="right", padx=4)
+        ttk.Button(bar, text=tr("settings_cancel"),
+                   command=win.destroy).pack(side="right", padx=4)
 
     def _instance_choices(self):
         return [f"{i['name']}  ({i['path']})" for i in self.instances]
@@ -241,32 +484,42 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     # Меню
     # =====================================================
     def create_menu(self):
-        menubar = tk.Menu(self)
+        menubar = tk.Menu(self, **self._menu_opts())
 
-        m_file = tk.Menu(menubar, tearoff=0)
+        m_file = tk.Menu(menubar, tearoff=0, **self._menu_opts())
         m_file.add_command(label=tr("menu_select_game"),
                            command=self.menu_select_game)
         m_file.add_command(label=tr("menu_setup_clean_backup"),
                            command=self.menu_setup_clean_backup)
         m_file.add_command(label=tr("menu_change_exe"),
                            command=self.menu_change_exe)
+        m_file.add_separator()
+        # Функции бывших кнопок страницы «Установка» (в новом интерфейсе
+        # страницы их нет — живут здесь).
+        m_file.add_command(label=tr("backup"), command=self.create_backup)
+        m_file.add_command(label=tr("restore"), command=self.restore_backup)
+        m_file.add_command(label=tr("cleanup"), command=self.cleanup)
         menubar.add_cascade(label=tr("menu_file"), menu=m_file)
 
-        m_settings = tk.Menu(menubar, tearoff=0)
+        m_settings = tk.Menu(menubar, tearoff=0, **self._menu_opts())
         m_settings.add_command(label=tr("menu_settings_open"),
                                command=self.open_settings_dialog)
         menubar.add_cascade(label=tr("menu_settings"), menu=m_settings)
 
-        m_service = tk.Menu(menubar, tearoff=0)
+        m_service = tk.Menu(menubar, tearoff=0, **self._menu_opts())
         m_service.add_command(label=tr("menu_service_open"),
                               command=self.open_service_dialog)
         menubar.add_cascade(label=tr("menu_service"), menu=m_service)
 
-        m_help = tk.Menu(menubar, tearoff=0)
+        m_trackers = tk.Menu(menubar, tearoff=0, **self._menu_opts())
+        self._fill_trackers_menu(m_trackers)
+        menubar.add_cascade(label=tr("menu_trackers"), menu=m_trackers)
+
+        m_help = tk.Menu(menubar, tearoff=0, **self._menu_opts())
         m_help.add_command(label=tr("menu_help_open"), command=self.open_help)
         menubar.add_cascade(label=tr("menu_help"), menu=m_help)
 
-        m_about = tk.Menu(menubar, tearoff=0)
+        m_about = tk.Menu(menubar, tearoff=0, **self._menu_opts())
         # «О программе» в v0.16 переоткрывает help.html (по промпту).
         m_about.add_command(label=tr("menu_about"),
                             command=self.open_help)
@@ -339,13 +592,22 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def open_settings_dialog(self):
         win = tk.Toplevel(self)
         win.title(tr("settings_title"))
-        # Бывшее 560x540 — расширил по вертикали и горизонтали:
-        # тексты с длинными словами не обрезаются.
-        win.geometry("780x720")
         win.transient(self)
         win.resizable(True, True)
-        win.minsize(680, 600)
+        win.minsize(700, 640)
         apply_icon(win)
+        self._center_window(win, 820, 780)
+
+        # Шрифт в настройках — крупнее стандартного.
+        style = ttk.Style(win)
+        style.configure("Set.TCheckbutton", font=("Segoe UI", 11))
+        style.configure("Set.TLabelframe.Label",
+                        font=("Segoe UI", 12, "bold"))
+        style.configure("Set.TLabelframe", padding=(8, 6))
+        style.configure("Set.TLabel", font=("Segoe UI", 11))
+        style.configure("Set.TSpinbox", font=("Segoe UI", 11))
+        style.configure("Set.TCombobox", font=("Segoe UI", 11))
+        style.configure("Set.TButton", font=("Segoe UI", 10))
 
         s = self.settings
         v_logo = tk.BooleanVar(value=s.get("insert_logo", True))
@@ -360,88 +622,140 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         v_alt_logo = tk.BooleanVar(value=s.get("use_alt_logo", False))
         v_auto_ws = tk.BooleanVar(
             value=s.get("auto_widescreen_detect", True))
+        v_dark = tk.BooleanVar(value=s.get("dark_theme", False))
         v_recommend_on = tk.BooleanVar(value=s.get("recommended_count_on", True))
         v_recommend_n = tk.IntVar(
             value=s.get("recommended_count", DEFAULT_RECOMMENDED_COUNT))
 
-        body = ttk.Frame(win, padding=18)
+        wrap = ttk.Frame(win, padding=14)
+        wrap.pack(fill="both", expand=True)
+        body = ttk.Frame(wrap)
         body.pack(fill="both", expand=True)
 
-        ttk.Checkbutton(body, text=tr("settings_insert_logo"),
-                        variable=v_logo).pack(anchor="w", pady=4)
-        ttk.Checkbutton(body, text=tr("settings_widescreen"),
-                        variable=v_widescreen).pack(anchor="w", pady=4)
-        ttk.Checkbutton(body, text=tr("settings_conflict_check"),
-                        variable=v_conflict).pack(anchor="w", pady=4)
-        ttk.Checkbutton(body, text=tr("settings_immutable_saves"),
-                        variable=v_immutable).pack(anchor="w", pady=4)
-        ttk.Checkbutton(body, text=tr("settings_auto_backup_saves"),
-                        variable=v_auto_backup).pack(anchor="w", pady=4)
-        ttk.Checkbutton(
-            body, text=tr("settings_experimental_autodetect_target_version"),
-            variable=v_autodetect_tv).pack(anchor="w", pady=4)
-        ttk.Checkbutton(body, text=tr("settings_use_alt_logo"),
-                        variable=v_alt_logo).pack(anchor="w", pady=4)
-        ttk.Checkbutton(body, text=tr("settings_auto_widescreen_detect"),
-                        variable=v_auto_ws).pack(anchor="w", pady=4)
+        def section(icon: str, key: str, first: bool = False):
+            lf = ttk.LabelFrame(body, text=f"{icon}  {tr(key)}",
+                                style="Set.TLabelframe")
+            lf.pack(fill="x", pady=(0 if first else 10, 0))
+            return lf
 
-        rcrow = ttk.Frame(body)
-        rcrow.pack(anchor="w", pady=6, fill="x")
-        ttk.Checkbutton(rcrow, text=tr("settings_recommended_count_on"),
-                        variable=v_recommend_on).pack(side="left")
-        ttk.Label(rcrow, text=tr("settings_recommended_count_value")).pack(
-            side="left", padx=(20, 4))
-        ttk.Spinbox(rcrow, from_=1, to=99, textvariable=v_recommend_n,
-                    width=4).pack(side="left")
+        # 🎨 Внешний вид / логотип
+        sec_look = section("🎨", "settings_section_appearance", first=True)
+        ttk.Checkbutton(sec_look, text=tr("settings_insert_logo"),
+                        variable=v_logo,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
+        ttk.Checkbutton(sec_look, text=tr("settings_use_alt_logo"),
+                        variable=v_alt_logo,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
+        ttk.Checkbutton(sec_look, text=tr("settings_widescreen"),
+                        variable=v_widescreen,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
+        ttk.Checkbutton(sec_look, text=tr("settings_auto_widescreen_detect"),
+                        variable=v_auto_ws,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
+        ttk.Checkbutton(sec_look, text=tr("settings_dark_theme"),
+                        variable=v_dark,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
 
-        cmprow = ttk.Frame(body)
-        cmprow.pack(anchor="w", pady=6, fill="x")
-        ttk.Checkbutton(cmprow, text=tr("settings_compress_backups"),
-                        variable=v_compress).pack(side="left")
-        ttk.Label(cmprow, text=tr("settings_compress_level")).pack(
-            side="left", padx=(20, 4))
-        ttk.Combobox(cmprow, textvariable=v_compress_lvl,
+        # 🛡️ Резервные копии и сохранения
+        sec_backup = section("🛡️", "settings_section_backups")
+        ttk.Checkbutton(sec_backup, text=tr("settings_compress_backups"),
+                        variable=v_compress,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
+        lvll = ttk.Frame(sec_backup)
+        lvll.pack(anchor="w", padx=(24, 0), pady=(0, 3))
+        ttk.Label(lvll, text=tr("settings_compress_level"),
+                  style="Set.TLabel").pack(side="left", padx=(0, 6))
+        ttk.Combobox(lvll, textvariable=v_compress_lvl,
                      values=[1, 3, 5, 7], state="readonly",
-                     width=4).pack(side="left")
+                     width=4, style="Set.TCombobox").pack(side="left")
+        ttk.Checkbutton(sec_backup, text=tr("settings_immutable_saves"),
+                        variable=v_immutable,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
+        ttk.Checkbutton(sec_backup, text=tr("settings_auto_backup_saves"),
+                        variable=v_auto_backup,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
 
-        ttk.Separator(body).pack(fill="x", pady=14)
+        # 🧩 Моды и совместимость
+        sec_mods = section("🧩", "settings_section_mods")
+        ttk.Checkbutton(sec_mods, text=tr("settings_conflict_check"),
+                        variable=v_conflict,
+                        style="Set.TCheckbutton").pack(anchor="w", pady=3)
+        rcl = ttk.Frame(sec_mods)
+        rcl.pack(anchor="w", padx=(24, 0), pady=(0, 3))
+        ttk.Label(rcl, text=tr("settings_recommended_count_value"),
+                  style="Set.TLabel").pack(side="left", padx=(0, 6))
+        ttk.Checkbutton(rcl, text=tr("settings_recommended_count_on"),
+                        variable=v_recommend_on,
+                        style="Set.TCheckbutton").pack(
+            side="left", padx=(14, 0))
+        ttk.Spinbox(rcl, from_=1, to=99, textvariable=v_recommend_n,
+                    width=4, style="Set.TSpinbox").pack(side="left")
+        ttk.Checkbutton(
+            sec_mods, text=tr("settings_experimental_autodetect_target_version"),
+            variable=v_autodetect_tv,
+            style="Set.TCheckbutton").pack(anchor="w", pady=3)
 
-        btns = ttk.Frame(body)
-        btns.pack(anchor="w", pady=4, fill="x")
-        ttk.Button(btns, text=tr("patch_dll"),
+        ttk.Separator(wrap).pack(fill="x", pady=12)
+
+        btns = ttk.Frame(wrap)
+        btns.pack(anchor="w", fill="x")
+        ttk.Button(btns, text=tr("patch_dll"), style="Set.TButton",
                    command=lambda: self.patch_dll(parent=win)).pack(
             side="left", padx=4)
-        ttk.Button(btns, text=tr("settings_clear_cache"),
+        ttk.Button(btns, text=tr("settings_clear_cache"), style="Set.TButton",
                    command=lambda: self._clear_cache_action(parent=win)).pack(
             side="left", padx=4)
 
-        bar = ttk.Frame(win)
-        bar.pack(side="bottom", pady=14)
+        bar = ttk.Frame(wrap)
+        bar.pack(fill="x", pady=(12, 0))
+        ttk.Button(bar, text=tr("settings_save"), style="Set.TButton",
+                   command=lambda: self._settings_save(win, {
+                       "insert_logo": v_logo.get(),
+                       "widescreen": v_widescreen.get(),
+                       "compress_backups": v_compress.get(),
+                       "compress_level": int(v_compress_lvl.get()),
+                       "conflict_check": v_conflict.get(),
+                       "immutable_saves": v_immutable.get(),
+                       "auto_backup_saves": v_auto_backup.get(),
+                       "experimental_autodetect_target_version":
+                           v_autodetect_tv.get(),
+                       "use_alt_logo": v_alt_logo.get(),
+                       "auto_widescreen_detect": v_auto_ws.get(),
+                       "recommended_count_on": v_recommend_on.get(),
+                       "recommended_count": v_recommend_n.get(),
+                       "dark_theme": v_dark.get(),
+                   })).pack(side="right", padx=4)
+        ttk.Button(bar, text=tr("settings_cancel"), style="Set.TButton",
+                   command=win.destroy).pack(side="right", padx=4)
 
-        def do_save():
-            self.settings["insert_logo"] = v_logo.get()
-            self.settings["widescreen"] = v_widescreen.get()
-            self.settings["compress_backups"] = v_compress.get()
-            self.settings["compress_level"] = int(v_compress_lvl.get())
-            self.settings["conflict_check"] = v_conflict.get()
-            self.settings["immutable_saves"] = v_immutable.get()
-            self.settings["auto_backup_saves"] = v_auto_backup.get()
-            self.settings["experimental_autodetect_target_version"] = v_autodetect_tv.get()
-            self.settings["use_alt_logo"] = v_alt_logo.get()
-            self.settings["auto_widescreen_detect"] = v_auto_ws.get()
-            self.settings["recommended_count_on"] = v_recommend_on.get()
-            try:
-                self.settings["recommended_count"] = max(
-                    1, int(v_recommend_n.get()))
-            except Exception:
-                self.settings["recommended_count"] = DEFAULT_RECOMMENDED_COUNT
-            self.save_cfg()
-            win.destroy()
-
-        ttk.Button(bar, text=tr("settings_save"),
-                   command=do_save).pack(side="left", padx=10)
-        ttk.Button(bar, text=tr("settings_cancel"),
-                   command=win.destroy).pack(side="left", padx=10)
+    def _settings_save(self, win, values: dict):
+        old_dark = self._theme_dark()
+        self.settings["insert_logo"] = values["insert_logo"]
+        self.settings["widescreen"] = values["widescreen"]
+        self.settings["compress_backups"] = values["compress_backups"]
+        self.settings["compress_level"] = values["compress_level"]
+        self.settings["conflict_check"] = values["conflict_check"]
+        self.settings["immutable_saves"] = values["immutable_saves"]
+        self.settings["auto_backup_saves"] = values["auto_backup_saves"]
+        self.settings["experimental_autodetect_target_version"] = \
+            values["experimental_autodetect_target_version"]
+        self.settings["use_alt_logo"] = values["use_alt_logo"]
+        self.settings["auto_widescreen_detect"] = values["auto_widescreen_detect"]
+        self.settings["recommended_count_on"] = values["recommended_count_on"]
+        self.settings["dark_theme"] = values.get("dark_theme", False)
+        try:
+            self.settings["recommended_count"] = max(
+                1, int(values["recommended_count"]))
+        except Exception:
+            self.settings["recommended_count"] = DEFAULT_RECOMMENDED_COUNT
+        self.save_cfg()
+        theme_changed = self._theme_dark() != old_dark
+        win.destroy()
+        if theme_changed:
+            # ttk-стили применяются мгновенно, классические tk-виджеты
+            # пересоздаются вместе с интерфейсом.
+            self._apply_theme()
+            self.rebuild_ui()
 
     def _clear_cache_action(self, parent=None):
         n = clear_logo_cache()
@@ -452,9 +766,9 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def open_service_dialog(self):
         win = tk.Toplevel(self)
         win.title(tr("service_title"))
-        win.geometry("560x520")
         win.transient(self)
         apply_icon(win)
+        self._center_window(win, 560, 520)
 
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both", expand=True)
@@ -478,11 +792,31 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         ttk.Button(body, text=tr("service_manage_instances"),
                    command=lambda: self._service_manage_instances(win)).pack(
             fill="x", pady=4)
-        ttk.Button(body, text=tr("service_cache_sounds"),
-                   command=lambda: self._service_cache_sounds(win)).pack(
+        ttk.Button(body, text=tr("service_patching"),
+                   command=lambda: self._service_patching(win)).pack(
+            fill="x", pady=4)
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=6)
+        if self.settings.get("new_install_ui", True):
+            ui_label = tr("service_ui_old")
+        else:
+            ui_label = tr("service_ui_new")
+        ttk.Button(body, text=ui_label,
+                   command=lambda: self._toggle_interface_version(win)).pack(
             fill="x", pady=4)
         ttk.Button(body, text=tr("close"),
                    command=win.destroy).pack(side="bottom", pady=10)
+
+    def _toggle_interface_version(self, win=None):
+        """Переключает старый/новый интерфейс страницы «Установка»."""
+        self.settings["new_install_ui"] = \
+            not self.settings.get("new_install_ui", True)
+        self.save_cfg()
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self.rebuild_ui()
 
     def _service_revert_one(self, parent):
         inst = self.instance
@@ -528,12 +862,18 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def _service_troubleshoot(self, parent):
         win = tk.Toplevel(parent)
         win.title(tr("service_troubleshoot"))
-        win.geometry("680x520")
         win.transient(parent)
         apply_icon(win)
+        self._center_window(win, 680, 540)
+        win.minsize(680, 480)
 
         body = ttk.Frame(win, padding=16)
         body.pack(fill="both", expand=True)
+
+        # Панель кнопок резервируем внизу ПЕРВОЙ — иначе при малой
+        # высоте окна кнопки уезжают за нижний край и не видны.
+        row = ttk.Frame(body)
+        row.pack(side="bottom", fill="x", pady=(8, 0))
 
         ttk.Label(body, text=tr("ts_step1_title"),
                   font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 6))
@@ -546,6 +886,9 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         ttk.Radiobutton(body, text=tr("ts_scope_one_mod"),
                         variable=scope_var, value="one_mod").pack(
             anchor="w", pady=2)
+        ttk.Radiobutton(body, text=tr("ts_scope_game_wont_start"),
+                        variable=scope_var,
+                        value="game_wont_start").pack(anchor="w", pady=2)
 
         ttk.Label(body, text=tr("ts_pick_mod")).pack(anchor="w", pady=(8, 2))
         all_mods = load_json(PATHS["mods_json"], [])
@@ -555,7 +898,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                           state="readonly")
         cb.pack(fill="x", pady=2)
 
-        out = tk.Text(body, wrap=tk.WORD, height=14)
+        out = tk.Text(body, wrap=tk.WORD, height=14, **self._tk_text_opts())
         out.pack(fill="both", expand=True, pady=(10, 4))
         out.config(state="disabled")
 
@@ -571,6 +914,11 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             out.config(state="disabled")
             inst = self.instance
             scope = scope_var.get()
+            if scope == "game_wont_start":
+                _print(tr("ts_game_wont_start_hint"))
+                _print("→ " + GAME_WONT_START_URL)
+                webbrowser.open(GAME_WONT_START_URL)
+                return
             if scope == "one_mod":
                 name = mod_var.get()
                 target = next((m for m in all_mods
@@ -606,6 +954,9 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                             files=", ".join(issue["files"])))
                     elif k == "no_resource_dirs":
                         _print("  ✗ " + tr("ts_issue_no_dirs"))
+                    elif k == "not_game_root":
+                        _print("  ✗ " + tr("ts_issue_not_game_root").format(
+                            files=", ".join(issue["files"])))
                 for rec in r["recommendations"]:
                     _print("    → " + rec)
             if any_issue:
@@ -658,8 +1009,6 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self.update()
             info_box(win, tr("ok"), tr("ts_report_copied"))
 
-        row = ttk.Frame(body)
-        row.pack(fill="x", pady=(4, 0))
         ttk.Button(row, text=tr("ts_run"),
                    command=_run_and_track).pack(side="left", padx=2)
         ttk.Button(row, text=tr("ts_report_btn"),
@@ -699,7 +1048,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         log_frame = ttk.LabelFrame(body, text=tr("finder_log"))
         log_frame.pack(fill="both", expand=True, pady=8)
-        log_box = tk.Text(log_frame, height=8, wrap=tk.WORD)
+        log_box = tk.Text(log_frame, height=8, wrap=tk.WORD,
+                          **self._tk_text_opts())
         log_box.pack(fill="both", expand=True, padx=4, pady=4)
         log_box.config(state="disabled")
 
@@ -871,54 +1221,89 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         populate()
 
-    # ---------- Cache Sounds ----------
-    def _service_cache_sounds(self, parent):
-        """Кэширование папки sounds/ во внутренний кэш MMI и применение
-        к выбранному экземпляру.
-
-        Это НЕ распаковка .dta — у лицензий вырезанные треки изначально
-        отсутствуют в файлах игры, поэтому распаковывать нечего.
-        Нужен внешний источник (диск, старая инсталляция, бэкап).
-        """
+    # ---------- Patching ----------
+    def _service_patching(self, parent):
+        """Окно «Патчинг»: скачивание патчей в data/patches/ и установка
+        в выбранный экземпляр игры."""
         win = tk.Toplevel(parent)
-        win.title(tr("service_cache_sounds"))
-        win.geometry("760x560")
+        win.title(tr("service_patching"))
         win.transient(parent)
+        win.resizable(True, True)
+        win.minsize(620, 580)
         apply_icon(win)
+        self._center_window(win, 700, 660)
 
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text=tr("cache_sounds_title"),
-                  font=("Arial", 13, "bold")).pack(anchor="w")
-        ttk.Label(body, text=tr("cache_sounds_explainer"),
-                  wraplength=720, justify="left",
-                  foreground="#cccccc").pack(anchor="w", pady=(4, 8))
-        ttk.Label(body, text=tr("cache_sounds_advice"),
-                  wraplength=720, justify="left",
-                  foreground="#9aa0a6").pack(anchor="w", pady=(0, 12))
+        ttk.Label(body, text=tr("patching_hint"),
+                  wraplength=660, justify="left").pack(anchor="w", pady=(0, 8))
 
-        # Текущее состояние кэша
-        status_frame = ttk.LabelFrame(body, text=tr("cache_sounds_status"))
-        status_frame.pack(fill="x", pady=4)
-        status_lbl = ttk.Label(status_frame, text="")
-        status_lbl.pack(anchor="w", padx=8, pady=6)
+        # Выбор экземпляра игры
+        inst_row = ttk.Frame(body)
+        inst_row.pack(fill="x", pady=2)
+        ttk.Label(inst_row, text=tr("patching_instance")).pack(side="left")
+        choices = self._instance_choices()
+        inst_var = tk.StringVar(
+            value=next((f"{i['name']}  ({i['path']})"
+                        for i in self.instances
+                        if i["id"] == self.current_instance_id),
+                       choices[0] if choices else ""))
+        ttk.Combobox(inst_row, textvariable=inst_var, values=choices,
+                     state="readonly").pack(side="left", padx=8, fill="x",
+                                            expand=True)
 
-        def refresh_status():
-            s = sounds_cache_status()
-            if s["cached"]:
-                mb = s["size"] / (1024 * 1024)
-                txt = tr("cache_sounds_status_cached").format(
-                    s["files"], f"{mb:.1f}", s.get("date") or "?")
-            else:
-                txt = tr("cache_sounds_status_empty")
-            status_lbl.config(text=txt)
+        # Что патчить: выбранный экземпляр и/или его чистая резервная копия.
+        # Чистая копия по умолчанию ВЫКЛЮЧЕНА: изменение её файлов опасно.
+        tgt_lf = ttk.LabelFrame(body, text=tr("patching_targets"),
+                                padding=(8, 6))
+        tgt_lf.pack(fill="x", pady=(8, 2))
+        v_target_inst = tk.BooleanVar(value=True)
+        v_target_clean = tk.BooleanVar(value=False)
 
-        # Лог операций
-        log_frame = ttk.LabelFrame(body, text=tr("finder_log"))
-        log_frame.pack(fill="both", expand=True, pady=8)
-        log_box = tk.Text(log_frame, height=10, wrap=tk.WORD)
-        log_box.pack(fill="both", expand=True, padx=4, pady=4)
+        def _on_clean_toggle():
+            """При включении цели «чистая резервная копия» — предупреждение.
+
+            Патч изменяет файлы копии необратимо, а она используется для
+            восстановления игры. Пользователь должен подтвердить осознанно."""
+            if not v_target_clean.get():
+                return
+            iid = self._instance_id_from_choice(inst_var.get())
+            inst = find_instance(self.instances, iid)
+            name = inst["name"] if inst else "?"
+            if not yesno(win, tr("patching_clean_warning_title"),
+                         tr("patching_clean_warning").format(name)):
+                v_target_clean.set(False)
+
+        ttk.Checkbutton(tgt_lf, text=tr("patching_target_instance"),
+                        variable=v_target_inst).pack(anchor="w", pady=2)
+        ttk.Checkbutton(tgt_lf, text=tr("patching_target_clean"),
+                        variable=v_target_clean,
+                        command=_on_clean_toggle).pack(anchor="w", pady=2)
+
+        # Галочки патчей
+        vars_by_id = {}
+        for p in PATCHES:
+            cached = bool(cached_patch_file(p["id"]))
+            v = tk.BooleanVar(value=False)
+            vars_by_id[p["id"]] = v
+            lf = ttk.Frame(body)
+            lf.pack(fill="x", pady=3)
+            ttk.Checkbutton(lf, text=tr(p["name_key"]),
+                            variable=v).pack(side="left")
+            if cached:
+                ttk.Label(lf, text=tr("patching_cached"),
+                          foreground="#7ec87e").pack(side="left", padx=8)
+            ttk.Label(body, text=tr(p["desc_key"]), wraplength=640,
+                      justify="left",
+                      foreground="#9aa0a6").pack(anchor="w", padx=(24, 0))
+
+        # Статус загрузки + лог
+        status_lbl = ttk.Label(body, text="")
+        status_lbl.pack(anchor="w", pady=(8, 0))
+        log_box = tk.Text(body, height=9, wrap=tk.WORD,
+                          **self._tk_text_opts())
+        log_box.pack(fill="both", expand=True, pady=(4, 8))
         log_box.config(state="disabled")
 
         def log(line):
@@ -926,84 +1311,103 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             log_box.insert(tk.END, line + "\n")
             log_box.config(state="disabled")
             log_box.see(tk.END)
-            win.update_idletasks()
-            # дублируем в основной лог приложения
             self.log(line)
 
-        # --- Действия ---
-        def cache_from_current():
-            inst = self.instance
+        prog = {"pending": False}
+
+        def _update_progress():
+            prog["pending"] = False
+            done = prog.get("done", 0)
+            total = prog.get("total", 0)
+            if total > 0:
+                status_lbl.config(text=tr("patching_progress").format(
+                    f"{done / 1048576:.1f}", f"{total / 1048576:.1f}"))
+            else:
+                status_lbl.config(text=tr("patching_progress_unknown").format(
+                    f"{done / 1048576:.1f}"))
+
+        def progress_cb(done, total):
+            prog["done"], prog["total"] = done, total
+            if not prog["pending"]:
+                prog["pending"] = True
+                win.after(150, _update_progress)
+
+        def thread_log(msg):
+            win.after(0, lambda m=msg: log(m))
+
+        def do_work():
+            iid = self._instance_id_from_choice(inst_var.get())
+            inst = find_instance(self.instances, iid)
             if not inst:
                 error_box(win, tr("error"), tr("ts_no_active"))
                 return
-            res = cache_sounds_from_folder(inst["path"], log)
-            if res["ok"]:
-                info_box(win, tr("ok"),
-                         tr("cache_sounds_cached_ok").format(res["files"]))
-            else:
-                error_box(win, tr("error"),
-                          res.get("error") or tr("error"))
-            refresh_status()
-
-        def cache_from_folder():
-            d = filedialog.askdirectory(
-                parent=win, title=tr("cache_sounds_pick_source"))
-            if not d:
+            selected = [p for p in PATCHES if vars_by_id[p["id"]].get()]
+            if not selected:
+                error_box(win, tr("error"), tr("patching_no_selection"))
                 return
-            res = cache_sounds_from_folder(d, log)
-            if res["ok"]:
-                info_box(win, tr("ok"),
-                         tr("cache_sounds_cached_ok").format(res["files"]))
-            else:
-                error_box(win, tr("error"),
-                          res.get("error") or tr("error"))
-            refresh_status()
-
-        def apply_to_current():
-            inst = self.instance
-            if not inst:
-                error_box(win, tr("error"), tr("ts_no_active"))
+            targets = []
+            if v_target_inst.get():
+                targets.append((inst["name"], inst["path"]))
+            if v_target_clean.get():
+                clean = get_instance_paths(inst["id"])["clean"]
+                if os.path.isdir(clean):
+                    targets.append(
+                        (f"{inst['name']} "
+                         f"({tr('patching_clean_suffix')})", clean))
+                else:
+                    error_box(win, tr("error"),
+                              tr("patching_no_clean").format(inst["name"]))
+                    return
+            if not targets:
+                error_box(win, tr("error"), tr("patching_no_target"))
                 return
-            res = apply_sounds_cache(inst["path"], log)
-            if res["ok"]:
-                info_box(win, tr("ok"),
-                         tr("cache_sounds_applied_ok").format(res["files"]))
-            else:
-                error_box(win, tr("error"),
-                          res.get("error") or tr("error"))
+            run_btn.config(state="disabled")
+            for p in selected:
+                vars_by_id[p["id"]].set(False)
 
-        def clear_cache():
-            if not yesno(win, tr("service_cache_sounds"),
-                         tr("cache_sounds_clear_confirm")):
-                return
-            sounds_clear_cache()
-            log(tr("cache_sounds_cleared"))
-            refresh_status()
+            def worker():
+                failed = []
+                for p in selected:
+                    try:
+                        thread_log(f"→ {tr(p['name_key'])}…")
+                        path = download_patch(p, log=thread_log,
+                                              progress=progress_cb)
+                        for tname, tpath in targets:
+                            result = install_patch_file(path, tpath)
+                            # Патч снести нельзя — фиксируем установку
+                            # для отчёта траблшутера.
+                            record_patch_install(
+                                p["id"], tr(p["name_key"]), tpath,
+                                result.get("files", []),
+                                source=p["url"])
+                            thread_log(tr("patching_installed_to").format(
+                                tr(p["name_key"]), tname,
+                                tr("patching_mode_extracted"
+                                   if result["mode"] == "extracted"
+                                   else "patching_mode_copied")))
+                    except Exception as e:
+                        failed.append(f"{tr(p['name_key'])}: {e}")
+                        thread_log(f"✗ {tr(p['name_key'])}: {e}")
+                win.after(0, lambda: _finish(failed))
 
-        # --- Кнопки ---
-        row1 = ttk.LabelFrame(body, text=tr("cache_sounds_step1"))
-        row1.pack(fill="x", pady=4)
-        rb = ttk.Frame(row1)
-        rb.pack(anchor="w", padx=8, pady=6)
-        ttk.Button(rb, text=tr("cache_sounds_from_current"),
-                   command=cache_from_current).pack(side="left", padx=4)
-        ttk.Button(rb, text=tr("cache_sounds_from_folder"),
-                   command=cache_from_folder).pack(side="left", padx=4)
-        ttk.Button(rb, text=tr("cache_sounds_clear"),
-                   command=clear_cache).pack(side="left", padx=4)
+            def _finish(failed):
+                run_btn.config(state="normal")
+                status_lbl.config(text="")
+                if failed:
+                    error_box(win, tr("error"),
+                              tr("patching_failed") + "\n" + "\n".join(failed))
+                else:
+                    info_box(win, tr("ok"), tr("patching_done"))
 
-        row2 = ttk.LabelFrame(body, text=tr("cache_sounds_step2"))
-        row2.pack(fill="x", pady=4)
-        rb2 = ttk.Frame(row2)
-        rb2.pack(anchor="w", padx=8, pady=6)
-        ttk.Button(rb2, text=tr("cache_sounds_apply_current"),
-                   command=apply_to_current).pack(side="left", padx=4)
+            threading.Thread(target=worker, daemon=True).start()
 
-        ttk.Button(body, text=tr("close"),
-                   command=win.destroy).pack(side="bottom", anchor="e",
-                                             pady=(8, 0))
-
-        refresh_status()
+        bar = ttk.Frame(body)
+        bar.pack(fill="x")
+        run_btn = ttk.Button(bar, text=tr("patching_download_install"),
+                             command=do_work)
+        run_btn.pack(side="left", padx=4)
+        ttk.Button(bar, text=tr("close"),
+                   command=win.destroy).pack(side="right", padx=4)
 
     # ---------- Version info ----------
     def show_version_dialog(self):
@@ -1051,7 +1455,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         body = tk.Text(win, wrap=tk.WORD, height=15, width=64,
                        font=("Arial", 10), borderwidth=0,
-                       background=win.cget("background"))
+                       **(self._tk_text_opts()
+                          or {"background": win.cget("background")}))
         body.pack(padx=20, pady=10, fill="both", expand=True)
         body.insert("1.0", tr("about_text").format(DATA))
         body.config(state="disabled")
@@ -1229,9 +1634,14 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
     def log(self, text):
         line = f"[{now()}] {text}"
-        if hasattr(self, "logbox"):
+        if hasattr(self, "logbox") and self.logbox.winfo_exists():
             self.logbox.insert(tk.END, line + "\n")
             self.logbox.see(tk.END)
+        # В новом интерфейсе вместо блока лога — строка статуса.
+        try:
+            self.status_var.set(str(text))
+        except Exception:
+            pass
         append_log(line)
 
     def create_ui(self):
@@ -1271,6 +1681,123 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
     # ---------- INSTALL TAB ----------
     def build_install_tab(self):
+        """Страница «Установка»: новый дизайн (по умолчанию) или старый.
+        Переключатель — кнопка в окне Сервиса (настройка new_install_ui)."""
+        # Ссылки на виджеты прошлой версии страницы висят на self и после
+        # rebuild_ui указывают на уничтоженные виджеты — чистим.
+        for attr in ("mm_table", "mm_inner", "mm_canvas", "logbox"):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
+        if self.settings.get("new_install_ui", True):
+            self._build_install_tab_new()
+        else:
+            self._build_install_tab_old()
+
+    def _build_install_tab_new(self):
+        f = self.tab_install
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+
+        # --- Выбор экземпляра игры ---
+        top = ttk.Frame(f)
+        top.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text=tr("game")).grid(row=0, column=0, sticky="w", padx=5)
+        self.game_var = tk.StringVar()
+        cur_inst = self.instance
+        if cur_inst:
+            self.game_var.set(f"{cur_inst['name']}  ({cur_inst['path']})")
+        self.game_combo = ttk.Combobox(
+            top, textvariable=self.game_var,
+            values=self._instance_choices(), state="readonly")
+        self.game_combo.grid(row=0, column=1, sticky="ew", padx=5)
+        self.game_combo.bind("<<ComboboxSelected>>", self._on_game_selected)
+        self.game_combo.bind("<Button-3>", self._on_game_right_click)
+
+        right = ttk.Frame(top)
+        right.grid(row=0, column=2, padx=5, sticky="e")
+        add_btn = ttk.Button(right, text=tr("add_game"),
+                             command=self.menu_select_game)
+        add_btn.pack(side="left")
+        add_btn.bind("<Button-3>", self._add_game_context_menu)
+        ttk.Button(right, text="?", width=3,
+                   command=self.show_version_dialog).pack(side="left", padx=(4, 0))
+
+        # --- Центр: менеджер модов (основной блок) + колонка действий ---
+        center = ttk.Frame(f)
+        center.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        center.columnconfigure(0, weight=1)
+        center.rowconfigure(0, weight=1)
+
+        mm_lf = ttk.LabelFrame(center, text=tr("mod_manager"))
+        mm_lf.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        mm_lf.columnconfigure(0, weight=1)
+        mm_lf.rowconfigure(0, weight=1)
+        cols = ("sel", "name", "priority")
+        self.mm_table = ttk.Treeview(mm_lf, columns=cols, show="headings",
+                                     selectmode="browse", height=14)
+        self.mm_table.heading("sel", text="✓")
+        self.mm_table.heading("name", text=tr("name"),
+                              command=lambda: self._mm_sort_by("name"))
+        self.mm_table.heading("priority", text=tr("priority"),
+                              command=lambda: self._mm_sort_by("priority"))
+        self.mm_table.column("sel", width=42, anchor="center", stretch=False)
+        self.mm_table.column("name", width=330, anchor="w")
+        self.mm_table.column("priority", width=90, anchor="center",
+                             stretch=False)
+        mm_sb = ttk.Scrollbar(mm_lf, orient="vertical",
+                              command=self.mm_table.yview)
+        self.mm_table.configure(yscrollcommand=mm_sb.set)
+        self.mm_table.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        mm_sb.grid(row=0, column=1, sticky="ns", pady=4)
+        self.mm_table.bind("<Button-1>", self._mm_on_click)
+        self.mm_table.bind("<Double-1>", self._mm_on_double)
+        self.mm_table.bind("<Button-3>", self._mm_context_menu)
+        self.mm_table.bind("<space>", self._mm_on_space)
+
+        side = ttk.Frame(center, padding=(2, 0))
+        side.grid(row=0, column=1, sticky="ns")
+        side.columnconfigure(0, weight=1)
+
+        run_btn = ttk.Button(side, text=tr("run_game"), command=self.run_game)
+        run_btn.pack(fill="x", pady=(2, 6))
+        run_btn.bind("<Button-3>", self._run_context_menu)
+
+        b1 = ttk.Button(side, text=tr("install_to_game"),
+                        command=lambda: self.install_to_game(False))
+        b1.pack(fill="x", pady=6)
+        b1.bind("<Button-3>", self._run_context_menu)
+
+        # Самая большая кнопка — зелёная. ttk под Windows (vista) не красит
+        # фон кнопок, поэтому здесь классический tk.Button.
+        big = tk.Button(side, text=tr("install_and_run"),
+                        command=lambda: self.install_to_game(True),
+                        bg="#2e8b57", fg="#ffffff",
+                        activebackground="#3aa06a",
+                        activeforeground="#ffffff",
+                        disabledforeground="#5a5a5a",
+                        font=("Segoe UI", 11, "bold"),
+                        relief="flat", cursor="hand2", height=2)
+        big.pack(fill="x", pady=6)
+
+        self.auto_dta_var = tk.BooleanVar(
+            value=bool(self.settings.get("auto_extract_dta", True)))
+        ttk.Checkbutton(side, text=tr("auto_extract_dta"),
+                        variable=self.auto_dta_var,
+                        command=self._on_auto_dta_toggled).pack(
+            side="bottom", anchor="e", pady=(6, 2))
+
+        # --- Низ: строка статуса ---
+        bottom = ttk.Frame(f)
+        bottom.grid(row=2, column=0, sticky="ew", padx=5, pady=(2, 4))
+        bottom.columnconfigure(0, weight=1)
+        ttk.Label(bottom, textvariable=self.status_var).grid(
+            row=0, column=0, sticky="w", padx=6)
+
+    def _build_install_tab_old(self):
         f = self.tab_install
         f.columnconfigure(1, weight=1)
         f.rowconfigure(3, weight=1)
@@ -1289,8 +1816,10 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         right = ttk.Frame(f)
         right.grid(row=0, column=2, padx=5, pady=5, sticky="e")
-        ttk.Button(right, text=tr("add_game"),
-                   command=self.menu_select_game).pack(side="left")
+        add_btn = ttk.Button(right, text=tr("add_game"),
+                             command=self.menu_select_game)
+        add_btn.pack(side="left")
+        add_btn.bind("<Button-3>", self._add_game_context_menu)
         ver_btn = ttk.Button(right, text="?", width=3,
                              command=self.show_version_dialog)
         ver_btn.pack(side="left", padx=(4, 0))
@@ -1320,7 +1849,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         split.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
 
         log_frame = ttk.Frame(split)
-        self.logbox = tk.Text(log_frame, height=18, wrap=tk.WORD)
+        self.logbox = tk.Text(log_frame, height=18, wrap=tk.WORD,
+                              **self._tk_text_opts())
         sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.logbox.yview)
         self.logbox.configure(yscrollcommand=sb.set)
         self.logbox.pack(side="left", fill="both", expand=True)
@@ -1330,7 +1860,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         mm = ttk.LabelFrame(split, text=tr("mod_manager"))
         ttk.Label(mm, text=tr("mod_manager_hint"),
                   wraplength=320).pack(anchor="w", padx=6, pady=(4, 2))
-        self.mm_canvas = tk.Canvas(mm, highlightthickness=0)
+        self.mm_canvas = tk.Canvas(mm, highlightthickness=0,
+                                   **self._tk_canvas_opts())
         mm_sb = ttk.Scrollbar(mm, orient="vertical", command=self.mm_canvas.yview)
         self.mm_inner = ttk.Frame(self.mm_canvas)
         self.mm_inner.bind(
@@ -1375,13 +1906,24 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self.refresh_mod_manager()
             self.refresh_saves_list()
 
+    def _add_game_context_menu(self, event):
+        menu = tk.Menu(self, tearoff=0, **self._menu_opts())
+        menu.add_command(label=tr("service_instance_finder"),
+                         command=lambda: self._service_instance_finder(self))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def _on_game_right_click(self, event):
         inst = self.instance
         if not inst:
             return
-        menu = tk.Menu(self, tearoff=0)
+        menu = tk.Menu(self, tearoff=0, **self._menu_opts())
         menu.add_command(label=tr("game_open_explorer"),
                          command=lambda: open_path(inst["path"]))
+        menu.add_command(label=tr("game_patches"),
+                         command=lambda: self._service_patching(self))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1391,7 +1933,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         inst = self.instance
         if not inst:
             return
-        menu = tk.Menu(self, tearoff=0)
+        menu = tk.Menu(self, tearoff=0, **self._menu_opts())
         menu.add_command(label=tr("run_setup"),
                          command=lambda: self._run_aux("setup.exe", admin=True))
         menu.add_command(label=tr("run_mafiacon"),
@@ -1498,20 +2040,29 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                   font=("Arial", 13, "bold")).pack(anchor="w", pady=(2, 8))
         ttk.Label(f, text=tr("upload_hint")).pack(anchor="w", pady=2)
 
-        row1 = ttk.Frame(f)
-        row1.pack(fill="x", pady=6)
-        ttk.Entry(row1, textvariable=self.upload_path).pack(
-            side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Button(row1, text="📂 " + tr("select"),
+        # Выбор архива — всегда доступен (одна большая кнопка).
+        pick = ttk.Frame(f)
+        pick.pack(fill="x", pady=6)
+        ttk.Button(pick, text="📦 " + tr("upload_pick_archive"),
                    command=self.select_upload).pack(side="left")
-        ttk.Button(row1, text=tr("upload_select_folder_btn"),
-                   command=self.select_upload_folder).pack(side="left", padx=4)
+        ttk.Entry(pick, textvariable=self.upload_path).pack(
+            side="left", fill="x", expand=True, padx=(8, 0))
 
         ttk.Label(f, text=tr("upload_name")).pack(anchor="w", pady=(8, 2))
         ttk.Entry(f, textvariable=self.upload_name).pack(fill="x")
 
-        row2 = ttk.Frame(f)
-        row2.pack(fill="x", pady=(8, 2))
+        # «Дополнительно» — раскрывающийся блок.
+        self._upload_more_open = False
+        self.upload_more_btn = ttk.Button(
+            f, text=tr("upload_additional") + " ▾",
+            command=self._toggle_upload_more)
+        self.upload_more_btn.pack(anchor="w", pady=(12, 4))
+
+        more = ttk.Frame(f)
+        self.upload_more_frame = more
+
+        row2 = ttk.Frame(more)
+        row2.pack(fill="x", pady=(2, 4))
         ttk.Label(row2, text=tr("upload_priority")).pack(side="left")
         ttk.Spinbox(row2, from_=1, to=999,
                     textvariable=self.upload_priority,
@@ -1520,8 +2071,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                   foreground="gray").pack(side="left")
 
         # Целевая версия игры — опционально (по умолчанию игнорируется)
-        row3 = ttk.Frame(f)
-        row3.pack(fill="x", pady=(8, 2))
+        row3 = ttk.Frame(more)
+        row3.pack(fill="x", pady=(4, 2))
         self.upload_use_target_version = tk.BooleanVar(value=False)
         ttk.Checkbutton(row3, text=tr("upload_target_version_check"),
                         variable=self.upload_use_target_version,
@@ -1532,8 +2083,22 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             values=("",) + GAME_VERSIONS, state="disabled", width=10)
         self.upload_target_version_combo.pack(side="left", padx=10)
 
+        # Выбор папки с модом (вместо второй кнопки на основной панели).
+        ttk.Button(more, text="📂 " + tr("upload_select_folder_btn"),
+                   command=self.select_upload_folder).pack(anchor="w", pady=(6, 2))
+
         ttk.Button(f, text=tr("upload_btn"),
                    command=self.do_upload).pack(pady=14, anchor="w")
+
+    def _toggle_upload_more(self):
+        self._upload_more_open = not self._upload_more_open
+        if self._upload_more_open:
+            self.upload_more_frame.pack(fill="x", pady=4,
+                                        after=self.upload_more_btn)
+            self.upload_more_btn.config(text=tr("upload_additional") + " ▴")
+        else:
+            self.upload_more_frame.pack_forget()
+            self.upload_more_btn.config(text=tr("upload_additional") + " ▾")
 
     def _toggle_target_version_combo(self):
         if self.upload_use_target_version.get():
@@ -1584,7 +2149,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     # Контекстные меню
     # =====================================================
     def show_context_menu(self, event, widget):
-        menu = tk.Menu(self, tearoff=0)
+        menu = tk.Menu(self, tearoff=0, **self._menu_opts())
         menu.add_command(label=tr("copy"),
                          command=lambda: self._copy_text(widget))
         menu.add_command(label=tr("select_all_action"),
@@ -1607,20 +2172,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self.mods_table.selection_set(row)
         if not self.get_selected_mod():
             return
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label=tr("rename_mod"), command=self.rename_selected_mod)
-        menu.add_command(label=tr("priority_change"),
-                         command=self.change_selected_priority)
-        menu.add_command(label=tr("edit_target_version"),
-                         command=self.change_selected_target_version)
-        menu.add_command(label=tr("open_mod_folder"), command=self.open_mod_folder)
-        menu.add_command(label=tr("open_readme"), command=self.open_readme_file)
-        menu.add_command(label=tr("open_mmi_readme"),
-                         command=self.open_mmi_readme_file)
-        menu.add_command(label=tr("create_mmi"), command=self.open_mmi_dialog)
-        menu.add_separator()
-        menu.add_command(label=tr("remove_from_library"),
-                         command=self.remove_selected_mod)
+        menu = tk.Menu(self, tearoff=0, **self._menu_opts())
+        self._fill_mod_actions_menu(menu)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1639,6 +2192,10 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 (tr("all_files"), "*.*")])
         if path:
             self.upload_path.set(path)
+            # Авто-имя мода из имени архива («Fugitive Mission Mod»),
+            # если пользователь сам ничего не ввёл.
+            if not self.upload_name.get().strip():
+                self.upload_name.set(pretty_mod_name(os.path.basename(path)))
 
     def select_upload_folder(self):
         path = filedialog.askdirectory(parent=self, title=tr("select_mod_folder"))
@@ -1647,7 +2204,11 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
     def do_upload(self):
         path = self.upload_path.get()
-        name = self.upload_name.get().strip() or None
+        if not path:
+            return
+        # Пустое имя → автоматическое человекочитаемое из имени файла/папки.
+        name = self.upload_name.get().strip() or pretty_mod_name(
+            os.path.basename(path.rstrip("/\\")))
         try:
             priority = int(self.upload_priority.get())
             if priority < 1:
@@ -1689,7 +2250,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         win.geometry("520x400")
         win.transient(self)
         apply_icon(win)
-        tx = tk.Text(win, wrap=tk.WORD, font=("Arial", 10))
+        tx = tk.Text(win, wrap=tk.WORD, font=("Arial", 10),
+                     **self._tk_text_opts())
         tx.pack(fill="both", expand=True, padx=10, pady=10)
         tx.insert("1.0", text)
         tx.config(state="disabled")
@@ -1907,6 +2469,7 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             self.log(tr("install_to_game_complete"))
             self.instances = load_json(PATHS["instances_json"], [])
             self.refresh_mods_list()
+            self.refresh_mod_manager()
             self.refresh_saves_list()
             # После установки повторяем auto-detect widescreen (мод мог
             # положить dinput8.dll / scripts/Mafia.WidescreenFix.asi).
@@ -1922,7 +2485,12 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             error_box(self, tr("error"), str(e))
 
     def clear_log(self):
-        self.logbox.delete("1.0", tk.END)
+        if hasattr(self, "logbox") and self.logbox.winfo_exists():
+            self.logbox.delete("1.0", tk.END)
+        try:
+            self.status_var.set("")
+        except Exception:
+            pass
 
     # =====================================================
     # Refresh
@@ -1965,21 +2533,145 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
             ))
 
     def refresh_mod_manager(self):
-        if not hasattr(self, "mm_inner"):
+        """Пересобирает менеджер модов (переменные галочек + виджеты).
+        Вызывается из refresh_all — галочки привязаны к active_mods."""
+        has_old = hasattr(self, "mm_inner") and self.mm_inner.winfo_exists()
+        has_new = hasattr(self, "mm_table") and self.mm_table.winfo_exists()
+        if not has_old and not has_new:
             return
-        for w in self.mm_inner.winfo_children():
-            w.destroy()
         self.mm_vars = {}
         inst = self.instance
         active_ids = set(inst.get("active_mods", [])) if inst else set()
-        for mod in sorted(load_json(PATHS["mods_json"], []),
-                          key=lambda m: int(m.get("priority", DEFAULT_PRIORITY))):
-            v = tk.BooleanVar(value=mod["id"] in active_ids)
-            self.mm_vars[mod["id"]] = v
-            label = (mod.get("name") or mod["id"]) + \
-                    f"  [p{mod.get('priority', DEFAULT_PRIORITY)}]"
-            ttk.Checkbutton(self.mm_inner, text=label,
-                            variable=v).pack(anchor="w", padx=6, pady=2)
+        all_mods = load_json(PATHS["mods_json"], [])
+        for mod in all_mods:
+            self.mm_vars[mod["id"]] = tk.BooleanVar(
+                value=mod["id"] in active_ids)
+        # Старый интерфейс — чекбоксы на канвасе.
+        if has_old:
+            for w in self.mm_inner.winfo_children():
+                w.destroy()
+            for mod in sorted(all_mods, key=lambda m: int(
+                    m.get("priority", DEFAULT_PRIORITY))):
+                label = (mod.get("name") or mod["id"]) + \
+                        f"  [p{mod.get('priority', DEFAULT_PRIORITY)}]"
+                ttk.Checkbutton(self.mm_inner, text=label,
+                                variable=self.mm_vars[mod["id"]]).pack(
+                    anchor="w", padx=6, pady=2)
+        # Новый интерфейс — таблица.
+        if has_new:
+            self._render_mm_table()
+
+    # ---------- Менеджер модов (таблица, новый интерфейс) ----------
+
+    def _render_mm_table(self):
+        """Заполняет таблицу менеджера. Отмеченные галочкой моды всегда
+        вверху (внутри группы — по выбранной сортировке)."""
+        t = self.mm_table
+        for row in t.get_children():
+            t.delete(row)
+        sort = getattr(self, "mm_sort", None) or {"col": "priority", "dir": 1}
+        self.mm_sort = sort
+        mods = load_json(PATHS["mods_json"], [])
+        # Трёхпроходная стабильная сортировка: алфавитный tiebreak →
+        # основная колонка (с направлением) → отмеченные первыми.
+        mods = sorted(mods, key=lambda m: (m.get("name") or m["id"]).lower())
+        if sort["col"] == "name":
+            mods = sorted(mods, key=lambda m: (m.get("name") or m["id"]).lower(),
+                          reverse=(sort["dir"] < 0))
+        else:
+            mods = sorted(mods,
+                          key=lambda m: int(m.get("priority", DEFAULT_PRIORITY)),
+                          reverse=(sort["dir"] < 0))
+        mods = sorted(mods,
+                      key=lambda m: 0 if self.mm_vars[m["id"]].get() else 1)
+        arrow = " ▲" if sort["dir"] > 0 else " ▼"
+        t.heading("name", text=tr("name")
+                  + (arrow if sort["col"] == "name" else ""))
+        t.heading("priority", text=tr("priority")
+                  + (arrow if sort["col"] == "priority" else ""))
+        for m in mods:
+            mark = "☑" if self.mm_vars[m["id"]].get() else "☐"
+            t.insert("", "end", iid=m["id"], values=(
+                mark, m.get("name", ""),
+                int(m.get("priority", DEFAULT_PRIORITY))))
+
+    def _mm_sort_by(self, col):
+        sort = getattr(self, "mm_sort", None) or {"col": "priority", "dir": 1}
+        if sort["col"] == col:
+            sort["dir"] = -sort["dir"]
+        else:
+            sort = {"col": col, "dir": 1}
+        self.mm_sort = sort
+        self._render_mm_table()
+
+    def _mm_toggle(self, mod_id):
+        var = self.mm_vars.get(mod_id)
+        if not var:
+            return
+        var.set(not var.get())
+        self._render_mm_table()
+        # Строка остаётся выделенной после пересортировки.
+        if self.mm_table.exists(mod_id):
+            self.mm_table.selection_set(mod_id)
+            self.mm_table.see(mod_id)
+
+    def _mm_on_click(self, event):
+        # Клик по ячейке «✓» переключает галочку, не меняя выделение.
+        row = self.mm_table.identify_row(event.y)
+        col = self.mm_table.identify_column(event.x)
+        if row and col == "#1":
+            self._mm_toggle(row)
+            return "break"
+
+    def _mm_on_double(self, event):
+        row = self.mm_table.identify_row(event.y)
+        if row:
+            self._mm_toggle(row)
+
+    def _mm_on_space(self, event):
+        sel = self.mm_table.selection()
+        if sel:
+            self._mm_toggle(sel[0])
+
+    def _mm_context_menu(self, event):
+        """ПКМ в менеджере — то же меню, что в библиотеке модов."""
+        row = self.mm_table.identify_row(event.y)
+        if row:
+            self.mm_table.selection_set(row)
+            # Действия меню работают через выделение в таблице библиотеки —
+            # выделяем тот же мод там (видимость не требуется).
+            try:
+                self.mods_table.selection_set(row)
+            except Exception:
+                pass
+        if not self.get_selected_mod():
+            return
+        menu = tk.Menu(self, tearoff=0, **self._menu_opts())
+        self._fill_mod_actions_menu(menu)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _fill_mod_actions_menu(self, menu):
+        """Общие пункты действий над модом (менеджер и библиотека)."""
+        menu.add_command(label=tr("rename_mod"),
+                         command=self.rename_selected_mod)
+        menu.add_command(label=tr("priority_change"),
+                         command=self.change_selected_priority)
+        menu.add_command(label=tr("edit_target_version"),
+                         command=self.change_selected_target_version)
+        menu.add_command(label=tr("open_mod_folder"),
+                         command=self.open_mod_folder)
+        menu.add_command(label=tr("open_readme"),
+                         command=self.open_readme_file)
+        menu.add_command(label=tr("open_mmi_readme"),
+                         command=self.open_mmi_readme_file)
+        menu.add_command(label=tr("create_mmi"),
+                         command=self.open_mmi_dialog)
+        menu.add_separator()
+        menu.add_command(label=tr("remove_from_library"),
+                         command=self.remove_selected_mod)
 
     def refresh_saves_list(self):
         if not hasattr(self, "saves_table"):
@@ -1989,14 +2681,22 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
         inst = self.instance
         if not inst:
             return
+        seen = set()
         for s in reversed(inst.get("saves", [])):
+            sid = s.get("id")
+            # Дубликаты id (например, после сбоев/старых версий) пропускаем —
+            # иначе ttk.Treeview падает с «Item already exists» и не даёт
+            # программе запуститься.
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
             type_ = s.get("type", "manual")
             type_str = tr(f"saves_type_{type_}")
             mods_meta = s.get("active_mods") or []
             mods_str = ", ".join(
                 (m.get("name") or m.get("id") or "?") for m in mods_meta
             ) if mods_meta else ""
-            self.saves_table.insert("", "end", iid=s["id"],
+            self.saves_table.insert("", "end", iid=sid,
                                     values=(s.get("date", ""),
                                             type_str,
                                             s.get("label", ""),
@@ -2124,7 +2824,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         list_frame = ttk.Frame(win)
         list_frame.pack(fill="both", expand=True, padx=12, pady=4)
-        lst = tk.Listbox(list_frame, height=8, activestyle="dotbox")
+        lst = tk.Listbox(list_frame, height=8, activestyle="dotbox",
+                         **self._tk_listbox_opts())
         lst.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(list_frame, orient="vertical", command=lst.yview)
         sb.pack(side="right", fill="y")
@@ -2241,7 +2942,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         body = ttk.Frame(win)
         body.pack(fill="both", expand=True, padx=10, pady=4)
-        canvas = tk.Canvas(body, highlightthickness=0)
+        canvas = tk.Canvas(body, highlightthickness=0,
+                           **self._tk_canvas_opts())
         sb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas)
         inner.bind("<Configure>",
@@ -2291,7 +2993,8 @@ class App(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         ttk.Label(win, text=tr("mmi_readme_label")).pack(
             anchor="w", padx=12, pady=(8, 2))
-        readme_text = tk.Text(win, height=5, wrap=tk.WORD)
+        readme_text = tk.Text(win, height=5, wrap=tk.WORD,
+                              **self._tk_text_opts())
         readme_text.pack(fill="x", padx=12, pady=2)
 
         bbar = ttk.Frame(win)

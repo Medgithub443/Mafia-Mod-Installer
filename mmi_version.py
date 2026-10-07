@@ -84,32 +84,37 @@ def _sha256(path: str) -> str:
 # ---------------------------------------------------------
 
 def detect_widescreen_fix(game_path: str) -> dict:
-    """Возвращает {'present': bool, 'dinput8': bool, 'asi': bool, 'ini': bool}.
+    """Возвращает {'present': bool, 'dinput8': bool, 'd3d8': bool,
+    'asi': bool, 'ini': bool}.
 
     Mafia.WidescreenFix кладёт:
-      • dinput8.dll в корень игры
+      • загрузчик ASI в корень игры — dinput8.dll (старые сборки) или
+        d3d8.dll (сборки с Ultimate ASI Loader, например Widescreen-Fix.zip
+        из репозитория patches-for-mafia-tclh)
       • scripts/Mafia.WidescreenFix.asi
       • scripts/Mafia.WidescreenFix.ini
-    Достаточно одновременно (a) и (b). dinput8.dll проверяем грубо
+    Достаточно одновременно (a) и (b). Загрузчик проверяем грубо
     по размеру (>500 KB) чтобы не путать с другими обёртками.
     """
-    out = {"present": False, "dinput8": False, "asi": False, "ini": False}
+    out = {"present": False, "dinput8": False, "d3d8": False,
+           "asi": False, "ini": False}
     if not game_path or not os.path.isdir(game_path):
         return out
-    di8 = os.path.join(game_path, "dinput8.dll")
     asi = os.path.join(game_path, "scripts", "Mafia.WidescreenFix.asi")
     ini = os.path.join(game_path, "scripts", "Mafia.WidescreenFix.ini")
-    if os.path.isfile(di8):
-        try:
-            if os.path.getsize(di8) > 500 * 1024:
-                out["dinput8"] = True
-        except OSError:
-            pass
+    for loader, key in (("dinput8.dll", "dinput8"), ("d3d8.dll", "d3d8")):
+        full = os.path.join(game_path, loader)
+        if os.path.isfile(full):
+            try:
+                if os.path.getsize(full) > 500 * 1024:
+                    out[key] = True
+            except OSError:
+                pass
     if os.path.isfile(asi):
         out["asi"] = True
     if os.path.isfile(ini):
         out["ini"] = True
-    out["present"] = out["dinput8"] and out["asi"]
+    out["present"] = (out["dinput8"] or out["d3d8"]) and out["asi"]
     return out
 
 

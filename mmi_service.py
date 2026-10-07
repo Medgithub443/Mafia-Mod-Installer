@@ -9,6 +9,9 @@ from mmi_utils import load_json, save_json, GAME_DIRS
 from mmi_instances import get_instance_paths, update_instance
 from mmi_installer import hard_restore_from
 from mmi_version import detect_game_version, is_rw_data_patched
+from mmi_patches import (PATCHES, REPORT_PATCH_NAMES, installed_patches,
+                         detect_patches_in_game)
+from mmi_recognizer import not_game_root_items
 
 
 # ---------------------------------------------------------
@@ -129,6 +132,19 @@ def analyze_mod(mod: dict, instance=None) -> dict:
             "tables и т.д.) и нет установщика. Скорее всего это не мод — "
             "удалите его из библиотеки.")
 
+    # Распознаватель мода: элементы верхнего уровня, которых нет в корне
+    # игры и которые не удалось отнести к какой-либо папке игры.
+    not_root = not_game_root_items(mod)
+    if not_root:
+        report["issues"].append({
+            "kind": "not_game_root",
+            "files": not_root,
+        })
+        report["recommendations"].append(
+            "В моде есть элементы, не относящиеся к корню игры и не "
+            "распознанные по карте Mafia. Проверьте структуру мода "
+            "(возможно, лишние файлы или нестандартная укладка).")
+
     if not report["issues"]:
         report["issues"].append({"kind": "ok"})
     return report
@@ -155,6 +171,68 @@ def troubleshoot_scope(scope: str, mod_id, instance) -> list:
 # ---------------------------------------------------------
 # Troubleshooter — текстовый отчёт
 # ---------------------------------------------------------
+
+def collect_installed_patches(instance) -> dict:
+    """Установленные патчи экземпляра: записи установки (installed.json)
+    + эвристика по характерным файлам. Патчи нельзя удалить, поэтому
+    записи живут всегда.
+
+    Возвращает {patch_id: {"name", "date", "files", "source",
+                 "heuristic"}} в стабильном порядке PATCHES."""
+    if not instance or not instance.get("path"):
+        return {}
+    game_path = instance["path"]
+    out = {}
+    for pid, info in installed_patches(game_path).items():
+        entry = dict(info)
+        entry["heuristic"] = False
+        out[pid] = entry
+    for pid, info in detect_patches_in_game(game_path).items():
+        if pid not in out:
+            entry = dict(info)
+            entry["heuristic"] = True
+            entry.setdefault("date", "")
+            out[pid] = entry
+    ordered = {}
+    for p in PATCHES:
+        if p["id"] in out:
+            ordered[p["id"]] = out.pop(p["id"])
+    ordered.update(out)  # неизвестные id (старые записи) — в конец
+    return ordered
+
+
+def _patch_block(pid: str, info: dict, game_path: str) -> list:
+    """Раздел отчёта об одном патче: статус + список файлов с проверкой."""
+    lines = []
+    name = info.get("name") or REPORT_PATCH_NAMES.get(pid, pid)
+    lines.append(f"  • {name} (id={pid})")
+    if info.get("heuristic"):
+        lines.append("    статус: обнаружен по характерным файлам "
+                     "(установлен не через MMI или до v0.17.2)")
+    else:
+        lines.append(f"    статус: установлен через MMI"
+                     + (f"  ({info['date']})" if info.get("date") else ""))
+    if info.get("source"):
+        lines.append(f"    источник: {info['source']}")
+    files = info.get("files") or []
+    if not files:
+        return lines
+    present = missing = 0
+    for rel in files:
+        full = os.path.join(game_path, rel)
+        if os.path.isfile(full):
+            present += 1
+        else:
+            missing += 1
+    lines.append(f"    файлов: {len(files)}"
+                 f" (на месте: {present}, отсутствует: {missing})")
+    for rel in files:
+        full = os.path.join(game_path, rel)
+        if os.path.isfile(full):
+            lines.append(f"      ✓ {rel}")
+        else:
+            lines.append(f"      ✗ ОТСУТСТВУЕТ: {rel}")
+    return lines
 
 def _file_sha256(path: str, limit_mb: int = 200) -> str:
     """SHA-256 файла. Для очень больших (>limit_mb) возвращает 'too-large'."""
@@ -235,9 +313,11 @@ def _mod_block(mod: dict) -> list:
 
 
 def build_troubleshooter_report(scope: str, mod_id, instance) -> str:
-    """Полный текстовый отчёт согласно prompt v0.15:
+    """Полный текстовый отчёт согласно prompt v0.15 (+ патчи с v0.17.2):
+        Шапка: отметка «Патчи: да/нет»
         1. Результаты проверок
         1.1. Версия игры и состояние rw_data.dll
+        1.2. Патчи (какие установлены, файлы с проверкой наличия)
         2. Tree файлов игры + SHA Game.exe и rw_data.dll
         3. Tree файлов мода (one_mod) или активных модов (active_in_game)
         4. Tree остальных модов (только для active_in_game)
@@ -245,6 +325,7 @@ def build_troubleshooter_report(scope: str, mod_id, instance) -> str:
     reports = troubleshoot_scope(scope, mod_id, instance)
     mods_all = load_json(PATHS["mods_json"], [])
     by_id = {m["id"]: m for m in mods_all}
+    patches = collect_installed_patches(instance)
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines = []
@@ -255,6 +336,8 @@ def build_troubleshooter_report(scope: str, mod_id, instance) -> str:
     if instance:
         lines.append(f"Экземпляр игры: {instance.get('name', '?')}  "
                      f"({instance.get('path', '')})")
+    # Отметка о патчах — сразу в шапке, чтобы было видно до всего остального.
+    lines.append(f"Патчи: {'ДА (' + str(len(patches)) + ')' if patches else 'НЕТ'}")
     lines.append("=" * 70)
 
     # 1 — результаты проверок
@@ -300,6 +383,19 @@ def build_troubleshooter_report(scope: str, mod_id, instance) -> str:
         lines.append(f"  rw_data.dll: {rw_state}")
     else:
         lines.append("  (экземпляр игры не выбран)")
+
+    # 1.2 — патчи (установлены необратимо, удалить их нельзя)
+    lines.append("\n1.2. ПАТЧИ")
+    lines.append("-" * 70)
+    if not patches:
+        lines.append("  патчи не установлены")
+    elif not (instance and instance.get("path")):
+        lines.append("  (экземпляр игры не выбран — нет пути для проверки файлов)")
+    else:
+        gp = instance["path"]
+        for pid, info in patches.items():
+            lines.extend(_patch_block(pid, info, gp))
+            lines.append("")
 
     # 2 — tree игры + SHA exe / dll
     lines.append("\n2. ФАЙЛЫ ЭКЗЕМПЛЯРА ИГРЫ")

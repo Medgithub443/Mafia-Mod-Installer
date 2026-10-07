@@ -17,6 +17,7 @@ from mmi_paths import (PATHS, APP_VERSION, DEFAULT_PRIORITY, MMI_README_LIMIT)
 from mmi_utils import (load_json, save_json, slugify, sha256_dir, now,
                        detect_root_folders, is_readme_path, find_readmes)
 from mmi_version import guess_target_version_from_readmes
+from mmi_recognizer import complete_mod_root, detect_roots_by_map
 
 
 # ---------------------------------------------------------
@@ -190,6 +191,10 @@ def _ingest_from_unpacked(unpacked_path: str, display_name: str,
                           autodetect_target_version: bool = False) -> tuple:
     roots = detect_root_folders(unpacked_path)
     if not roots:
+        # Классика не нашла game-like корень (например, мод кладёт FREERIDE
+        # в обёртки без папок ресурсов) — пробуем найти корень по карте игры.
+        roots = detect_roots_by_map(unpacked_path)
+    if not roots:
         # нет ни одного game-like корня — копируем всю переданную папку,
         # пользователь сам разберётся (вероятно странный мод, troubleshooter
         # это потом подсветит)
@@ -227,6 +232,11 @@ def _ingest_one_root(root_path: str, display_name: str,
     os.makedirs(target, exist_ok=True)
     shutil.copytree(root_path, target, dirs_exist_ok=True)
 
+    # Распознаватель мода: достраиваем структуру до 0-го уровня
+    # (FREERIDE → missions/FREERIDE) и запоминаем предупреждения для
+    # траблшутера. Карты нет — вернёт пустой результат, ничего не случится.
+    map_warnings = complete_mod_root(target)
+
     files_list = []
     for root, _, files in os.walk(target):
         for f in files:
@@ -245,6 +255,7 @@ def _ingest_one_root(root_path: str, display_name: str,
         "dir": target,
         "files": files_list,
         "mmi_readme": (mmi_readme or "")[:MMI_README_LIMIT],
+        "map_warnings": map_warnings,
     })
     save_json(PATHS["mods_json"], mods)
     return mod_id
